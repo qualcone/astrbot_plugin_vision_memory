@@ -1,8 +1,8 @@
 name: astrbot_plugin_vision_memory
-display_name: 识图与联网确认指引
-desc: 配合 LivingMemory：用识图模型把图片转成文字交给主模型，并引导模型联网确认不熟悉的角色后写入长期记忆。
-short_desc: 图转文 + 配合 LivingMemory
-version: v0.2.0
+display_name: 识图与角色记忆
+desc: 配合 LivingMemory：用更强的识图模型看图，并把联网核实后的角色信息写入长期记忆，避免重复检索。
+short_desc: 强识图模型 + 角色记忆写入 LivingMemory
+version: v0.3.0
 author: qualcone
 repo: https://github.com/qualcone/astrbot_plugin_vision_memory
 astrbot_version: ">=4.24.2"
