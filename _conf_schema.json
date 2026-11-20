@@ -70,7 +70,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "以 lm_ 开头，需具备 write 权限。在 LivingMemory 中用 /lmem apikey 创建。"
+    "hint": "以 lm_ 开头，需同时具备 read 和 write 权限（read 用于检查已有记忆以便更新而不是重复新增）。在 LivingMemory 中用 /lmem apikey 创建。"
   },
   "memory_scope": {
     "description": "写入的记忆范围",
@@ -85,7 +85,7 @@
   "guidance_prompt": {
     "description": "行为指引提示词",
     "type": "text",
-    "default": "当用户发来图片，或提到动漫、游戏角色、作品、表情包时：\n1. 只要你对角色名或出处不能完全确定（包括“好像见过”“有点眼熟”），就不要凭印象回答。\n2. 先调用 recall_long_term_memory 查询长期记忆。\n3. 查不到或仍不确定，联网搜索一次核实角色名和出处。\n4. 回复里明确说出角色名和作品名；搜索后仍无法确认的，如实说明不确定，不要编造。\n5. 仅在核实无误后调用 save_character_memory 保存，不要保存猜测。\n对你完全确定的内容无需搜索，也不要对每个问题都搜索。",
+    "default": "当用户发来图片，或提到动漫、游戏角色、作品、表情包时：\n1. 只要你对角色名或出处不能完全确定（包括“好像见过”“有点眼熟”），就不要凭印象回答。\n2. 先调用 recall_long_term_memory 查询长期记忆。\n3. 查不到，或记忆内容模糊、不全，就联网搜索一次核实角色名和出处。\n4. 回复里明确说出角色名和作品名；搜索后仍无法确认的，如实说明不确定，不要编造。\n5. 仅在核实无误后调用 save_character_memory 保存。记忆里已有该角色但不清晰时，同样调用它并提供完整信息，会更新原记录，不会重复新增。不要保存猜测。\n对你完全确定的内容无需搜索，也不要对每个问题都搜索。",
     "hint": "其中引用了本插件的 save_character_memory 工具（写入 LivingMemory）和 LivingMemory 自带的 recall_long_term_memory 召回工具；联网搜索依赖 AstrBot 内置 Web Search。"
   },
   "log_caption": {

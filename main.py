@@ -29,7 +29,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
-WRITE_PATH = "/page/external/memories"
+MEMORIES_PATH = "/page/external/memories"
+RECALL_PATH = "/page/external/recall"
+MAX_CANDIDATES = 5  # existing-memory candidates checked per save
+OWNED_KV_KEY = "owned_memory_ids_v1"
+MAX_OWNED_IDS = 2000
 PERSONA_NONE = "[%None]"
 
 _CAPTION_HEADER = (
@@ -75,6 +79,7 @@ class VisionMemory(Star):
         super().__init__(context)
         self.config = config
         self._warned_no_provider = False
+        self._write_lock = asyncio.Lock()
 
     # priority > default (0) so we run before LivingMemory's recall hook;
     # AstrBot sorts handlers by descending priority.
@@ -185,24 +190,21 @@ class VisionMemory(Star):
             logger.debug(f"[vision_memory] persona lookup failed: {type(e).__name__}: {e}")
             return None
 
-    def _post_memory(self, url, key, body):
-        """Blocking POST (run in a thread). Never follows redirects, so the key
-        cannot be forwarded to another host."""
+    def _request(self, method, url, key, body=None):
+        """Blocking HTTP call (run in a thread). Never follows redirects, so the
+        key cannot be forwarded to another host. Returns (status, json_dict)."""
 
         class _NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a, **kw):
                 return None
 
         opener = urllib.request.build_opener(_NoRedirect)
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {key}",
-            },
-        )
+        headers = {"Authorization": f"Bearer {key}"}
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with opener.open(req, timeout=15) as r:
                 try:
@@ -216,8 +218,93 @@ class VisionMemory(Star):
                 payload = {}
             return e.code, payload
 
+    async def _call(self, method, base, path, key, body=None):
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._request, method, base + path, key, body), timeout=20
+        )
+
+    # ---- ownership registry -------------------------------------------
+    # The plugin records the id of every memory it creates. Only registered ids
+    # may ever be archived; anything else (LivingMemory's own memories, other
+    # API clients, manually created records) is never touched.
+    async def _owned_ids(self):
+        try:
+            data = await self.get_kv_data(OWNED_KV_KEY, [])
+        except Exception as e:
+            logger.warning(f"[vision_memory] registry read failed: {type(e).__name__}")
+            return set()
+        return {i for i in data if isinstance(i, int)} if isinstance(data, list) else set()
+
+    async def _register_id(self, mid):
+        try:
+            ids = [i for i in (await self.get_kv_data(OWNED_KV_KEY, []) or []) if isinstance(i, int)]
+            if mid not in ids:
+                ids.append(mid)
+            await self.put_kv_data(OWNED_KV_KEY, ids[-MAX_OWNED_IDS:])
+        except Exception as e:
+            logger.warning(f"[vision_memory] registry write failed: {type(e).__name__}")
+
+    async def _unregister_id(self, mid):
+        try:
+            ids = [i for i in (await self.get_kv_data(OWNED_KV_KEY, []) or []) if isinstance(i, int) and i != mid]
+            await self.put_kv_data(OWNED_KV_KEY, ids)
+        except Exception as e:
+            logger.warning(f"[vision_memory] registry write failed: {type(e).__name__}")
+
+    async def _find_owned(self, base, key, name, work, scope, persona):
+        """Find ACTIVE memories previously written by this plugin for the same
+        character (same name and work). Returns (matches, note).
+
+        A record counts as ours only if ALL of these hold:
+          1. its id is in this plugin's own registry (we created it);
+          2. GET /memories/{id} says it is active with source == "external_api"
+             (guards against id reuse, e.g. after LivingMemory's db was reset);
+          3. it carries the exact key facts we write ("角色名：<name>" and
+             "作品：<work>").
+        Everything else (LivingMemory's own memories, other API clients, manual
+        records) is never archived or altered.
+        """
+        owned = await self._owned_ids()
+        if not owned:
+            return [], ""
+        body = {"query": f"{name} {work}", "k": 10}
+        if persona:
+            body["persona_id"] = persona
+        if scope:
+            body["scope"] = scope
+        try:
+            status, data = await self._call("POST", base, RECALL_PATH, key, body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return [], "无法检查已有记忆"
+        if status != 200 or data.get("status") != "ok":
+            return [], "无法检查已有记忆（Key 可能缺少 read 权限）"
+
+        want = {f"角色名：{name}", f"作品：{work}"}
+        matches = []
+        for item in (data.get("items") or [])[:MAX_CANDIDATES]:
+            mid = item.get("memory_id") if isinstance(item, dict) else None
+            if not isinstance(mid, int) or mid not in owned:
+                continue
+            try:
+                st, d = await self._call("GET", base, f"{MEMORIES_PATH}/{mid}", key)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            mem = d.get("memory") if st == 200 and isinstance(d, dict) else None
+            if not isinstance(mem, dict):
+                continue
+            if mem.get("status", "active") != "active" or mem.get("source") != "external_api":
+                continue
+            if want <= set(mem.get("key_facts") or []):
+                matches.append({"id": mid, "content": mem.get("content") or ""})
+        return matches, ""
+
     async def _lm_write(self, event, memory, topics, key_facts, name, work):
-        """Returns a user/model-facing message. Never raises."""
+        """Create or update the character memory. Returns a message for the
+        model. Never raises."""
         base = (self.config.get("lm_api_url") or "").strip().rstrip("/")
         key = (self.config.get("lm_api_key") or "").strip()
         if not base or not key:
@@ -230,57 +317,96 @@ class VisionMemory(Star):
         scope_mode = (self.config.get("memory_scope") or "session").strip()
         persona = await self._persona_id(event)
         scope = event.unified_msg_origin if scope_mode == "session" else None
-        body = {
-            "content": memory,
-            "topics": topics,
-            "key_facts": key_facts,
-            "importance": 0.8,
-            "source": "astrbot_plugin_vision_memory",
-            "idempotency_key": hashlib.sha1(
-                f"{scope}|{persona}|{name.lower()}|{work.lower()}".encode("utf-8")
-            ).hexdigest(),
-        }
-        if persona:
-            body["persona_id"] = persona
-        if scope:
-            body["scope"] = scope
+
+        def norm(t):
+            return " ".join((t or "").split())
+
         try:
-            status, data = await asyncio.wait_for(
-                asyncio.to_thread(self._post_memory, base + WRITE_PATH, key, body), timeout=20
-            )
+            async with self._write_lock:
+                matches, note = await self._find_owned(base, key, name, work, scope, persona)
+                if any(norm(m["content"]) == norm(memory) for m in matches):
+                    return "该角色已在长期记忆中，内容一致，无需更新。"
+
+                body = {
+                    "content": memory,
+                    "topics": topics,
+                    "key_facts": key_facts,
+                    "importance": 0.8,
+                    "source": "astrbot_plugin_vision_memory",
+                    "idempotency_key": hashlib.sha1(
+                        f"{scope}|{persona}|{name.lower()}|{work.lower()}|{norm(memory)}".encode("utf-8")
+                    ).hexdigest(),
+                }
+                if persona:
+                    body["persona_id"] = persona
+                if scope:
+                    body["scope"] = scope
+                status, data = await self._call("POST", base, MEMORIES_PATH, key, body)
+
+                if not (status == 200 and data.get("status") == "ok"):
+                    code = data.get("code") or f"http_{status}"
+                    logger.warning(f"[vision_memory] LivingMemory write rejected: status={status} code={code}")
+                    hints = {
+                        404: "LivingMemory 外部 API 未启用（external_api.enabled）或地址/端口不对。",
+                        401: "LivingMemory 外部 API Key 无效或已撤销。",
+                        403: "该 Key 没有写入权限，或 scope/persona 不在其允许范围内。",
+                        429: "写入过于频繁，被限流。",
+                    }
+                    return "写入 LivingMemory 失败：" + hints.get(status, f"{code}。")
+
+                new_id = data.get("memory_id")
+                if data.get("created") is True and isinstance(new_id, int):
+                    await self._register_id(new_id)  # only ids we actually created
+                logger.info(
+                    f"[vision_memory] memory written, id={new_id}, created={data.get('created')}, "
+                    f"replaces={[m['id'] for m in matches]}"
+                )
+                # update = new version written first, then older versions archived
+                failed = 0
+                for m in matches:
+                    if m["id"] == new_id:
+                        continue
+                    try:
+                        st, d = await self._call(
+                            "POST", base, f"{MEMORIES_PATH}/{m['id']}/archive", key, {}
+                        )
+                        ok = st == 200 and bool(d.get("archived"))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        ok = False
+                    if ok:
+                        await self._unregister_id(m["id"])
+                    else:
+                        failed += 1
+                        logger.warning(f"[vision_memory] archiving old memory {m['id']} failed")
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
-            logger.warning("[vision_memory] LivingMemory write timed out")
-            return "写入 LivingMemory 超时，未写入。"
+            logger.warning("[vision_memory] LivingMemory request timed out")
+            return "访问 LivingMemory 超时，写入可能未完成。"
         except Exception as e:
-            logger.warning(f"[vision_memory] LivingMemory write failed: {type(e).__name__}")
+            logger.warning(f"[vision_memory] LivingMemory request failed: {type(e).__name__}")
             return "无法连接 LivingMemory 外部 API，请确认已启用 external_api 且地址正确。"
 
-        if status == 200 and data.get("status") == "ok":
-            logger.info(
-                f"[vision_memory] memory written, id={data.get('memory_id')}, "
-                f"created={data.get('created')}"
-            )
-            return "已写入长期记忆。" if data.get("created", True) else "该角色已在长期记忆中。"
-        code = data.get("code") or f"http_{status}"
-        logger.warning(f"[vision_memory] LivingMemory write rejected: status={status} code={code}")
-        hints = {
-            404: "LivingMemory 外部 API 未启用（external_api.enabled）或地址/端口不对。",
-            401: "LivingMemory 外部 API Key 无效或已撤销。",
-            403: "该 Key 没有写入权限，或 scope/persona 不在其允许范围内。",
-            429: "写入过于频繁，被限流。",
-        }
-        return "写入 LivingMemory 失败：" + hints.get(status, f"{code}。")
+        if failed:
+            return f"新记忆已写入，但有 {failed} 条旧记录归档失败，可能存在重复。"
+        if matches:
+            return "已更新长期记忆（旧记录已归档）。"
+        if data.get("created", True) is False:
+            return "该角色已在长期记忆中。"
+        return "已写入长期记忆。" + (f"（注意：{note}，可能产生重复。）" if note else "")
 
     @filter.llm_tool(name="save_character_memory")
     async def save_character_memory(
         self, event: AstrMessageEvent, name: str, work: str, description: str, aliases: str = ""
     ):
-        """把已通过联网搜索或用户明确告知确认无误的动漫/游戏角色（或表情包）信息存入长期记忆，下次无需再搜索。未确认的信息不要保存。
+        """把已通过联网搜索或用户明确告知核实无误的动漫/游戏角色（或表情包）信息存入长期记忆，下次无需再搜索。如果记忆里已有该角色但模糊、不全或有误，核实后也调用本工具并提供完整信息，会更新原记录而不是新增。未核实的信息不要保存。
 
         Args:
             name(string): 角色名或表情包名称
             work(string): 所属作品名
-            description(string): 一句话外貌特征或出处说明
+            description(string): 外貌特征或出处说明（更新时请写完整，会替换原记录）
             aliases(string): 其他叫法，用英文逗号分隔，可为空
         """
         name = (name or "").strip()[:60]
