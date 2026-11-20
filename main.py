@@ -42,6 +42,32 @@ _CAPTION_HEADER = (
 )
 
 
+DEFAULT_KEYWORDS = [
+    "角色", "人物", "动漫", "动画", "漫画", "二次元", "游戏", "立绘", "表情包", "cos",
+    "是谁", "哪个作品", "哪部", "什么作品", "出自", "叫什么",
+]
+CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier image
+
+
+def _keywords(value) -> list:
+    """Accept a list or a comma/newline separated string; lower-cased, no blanks."""
+    if isinstance(value, str):
+        value = value.replace("，", ",").replace("\n", ",").split(",")
+    if not isinstance(value, (list, tuple)):
+        return [k.lower() for k in DEFAULT_KEYWORDS]
+    return [str(k).strip().lower() for k in value if str(k).strip()]
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+    return ""
+
+
 def _as_int(value, default: int, lo: int, hi: int) -> int:
     try:
         v = int(value)
@@ -95,8 +121,29 @@ class VisionMemory(Star):
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] caption stage crashed: {type(e).__name__}: {e}")
 
+    def _should_guide(self, req: ProviderRequest) -> bool:
+        """Decide whether this request needs the guidance prompt.
+
+        mode "always": every request. mode "auto" (default): only when the
+        message carries an image, the text contains a keyword, or an image was
+        described in the last few turns (so a follow-up like "他是谁" still works).
+        """
+        if (self.config.get("guidance_mode") or "auto").strip() == "always":
+            return True
+        if req.image_urls:
+            return True
+        text = (req.prompt or "").lower()
+        if any(k in text for k in _keywords(self.config.get("guidance_keywords", DEFAULT_KEYWORDS))):
+            return True
+        for m in (getattr(req, "contexts", None) or [])[-CONTEXT_LOOKBACK:]:
+            if isinstance(m, dict) and _CAPTION_HEADER in _text_of(m.get("content")):
+                return True
+        return False
+
     def _apply_guidance(self, req: ProviderRequest) -> None:
         if not self.config.get("enable_guidance", True):
+            return
+        if not self._should_guide(req):
             return
         guidance = (self.config.get("guidance_prompt") or "").strip()
         if guidance and guidance not in (req.system_prompt or ""):

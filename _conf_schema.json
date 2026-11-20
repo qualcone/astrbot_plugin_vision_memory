@@ -57,7 +57,43 @@
     "description": "追加行为指引",
     "type": "bool",
     "default": true,
-    "hint": "开启后，将下方“行为指引提示词”追加到系统提示词末尾，用于引导模型在不确定角色或出处时先查证、不编造。不会覆盖现有人设。"
+    "hint": "开启后，在需要时将“行为指引提示词”追加到系统提示词末尾，引导模型在不确定角色或出处时先查证、不编造。不会覆盖现有人设，也不会写入人设或数据库。"
+  },
+  "guidance_mode": {
+    "description": "指引注入时机",
+    "type": "string",
+    "options": [
+      "auto",
+      "always"
+    ],
+    "default": "auto",
+    "hint": "auto：仅当消息含图片、文字含下方关键词、或最近几轮出现过图片描述时才追加，普通闲聊不增加 token；always：每次请求都追加。"
+  },
+  "guidance_keywords": {
+    "description": "指引触发关键词",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "角色",
+      "人物",
+      "动漫",
+      "动画",
+      "漫画",
+      "二次元",
+      "游戏",
+      "立绘",
+      "表情包",
+      "cos",
+      "是谁",
+      "哪个作品",
+      "哪部",
+      "什么作品",
+      "出自",
+      "叫什么"
+    ],
+    "hint": "时机为 auto 时生效。消息文字包含任一关键词（不区分大小写）即追加指引。关键词越宽泛越容易触发，越少越省 token。"
   },
   "lm_api_url": {
     "description": "LivingMemory 外部 API 地址",
