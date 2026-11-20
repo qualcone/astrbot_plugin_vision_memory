@@ -34,6 +34,7 @@ RECALL_PATH = "/page/external/recall"
 MAX_CANDIDATES = 5  # existing-memory candidates checked per save
 OWNED_KV_KEY = "owned_memory_ids_v1"
 MAX_OWNED_IDS = 2000
+WRITE_TIMEOUT = 85  # seconds; LivingMemory's own request limit is 90s
 PERSONA_NONE = "[%None]"
 
 _CAPTION_HEADER = (
@@ -144,10 +145,12 @@ class VisionMemory(Star):
         if not self.config.get("enable_guidance", True):
             return
         if not self._should_guide(req):
+            logger.info("[vision_memory] guidance skipped (no image, trigger word or recent image context)")
             return
         guidance = (self.config.get("guidance_prompt") or "").strip()
         if guidance and guidance not in (req.system_prompt or ""):
             req.system_prompt = ((req.system_prompt or "") + "\n\n" + guidance).lstrip()
+            logger.info("[vision_memory] guidance appended to system prompt")
 
     async def _caption_one(self, pid: str, prompt: str, url: str, timeout: int, max_chars: int) -> str:
         """Caption one image. Returns text, or '' on any failure."""
@@ -237,7 +240,7 @@ class VisionMemory(Star):
             logger.debug(f"[vision_memory] persona lookup failed: {type(e).__name__}: {e}")
             return None
 
-    def _request(self, method, url, key, body=None):
+    def _request(self, method, url, key, body=None, timeout=30):
         """Blocking HTTP call (run in a thread). Never follows redirects, so the
         key cannot be forwarded to another host. Returns (status, json_dict)."""
 
@@ -253,7 +256,7 @@ class VisionMemory(Star):
             headers["Content-Type"] = "application/json; charset=utf-8"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with opener.open(req, timeout=15) as r:
+            with opener.open(req, timeout=timeout) as r:
                 try:
                     return r.status, json.loads(r.read().decode("utf-8") or "{}")
                 except ValueError:
@@ -265,9 +268,12 @@ class VisionMemory(Star):
                 payload = {}
             return e.code, payload
 
-    async def _call(self, method, base, path, key, body=None):
+    async def _call(self, method, base, path, key, body=None, timeout=30):
+        # LivingMemory computes an embedding before it answers a write, which can
+        # take well over 20s on a slow embedding provider (its own limit is 90s).
         return await asyncio.wait_for(
-            asyncio.to_thread(self._request, method, base + path, key, body), timeout=20
+            asyncio.to_thread(self._request, method, base + path, key, body, timeout),
+            timeout=timeout + 5,
         )
 
     # ---- ownership registry -------------------------------------------
@@ -355,6 +361,7 @@ class VisionMemory(Star):
         base = (self.config.get("lm_api_url") or "").strip().rstrip("/")
         key = (self.config.get("lm_api_key") or "").strip()
         if not base or not key:
+            logger.warning("[vision_memory] not written: LivingMemory API url or token is empty in plugin config")
             return "未配置 LivingMemory 外部 API 地址或 Key，未写入记忆。"
         if urlparse(base).scheme not in ("http", "https"):
             return "LivingMemory 外部 API 地址必须以 http:// 或 https:// 开头。"
@@ -388,11 +395,14 @@ class VisionMemory(Star):
                     body["persona_id"] = persona
                 if scope:
                     body["scope"] = scope
-                status, data = await self._call("POST", base, MEMORIES_PATH, key, body)
+                status, data = await self._call("POST", base, MEMORIES_PATH, key, body, timeout=WRITE_TIMEOUT)
 
                 if not (status == 200 and data.get("status") == "ok"):
                     code = data.get("code") or f"http_{status}"
-                    logger.warning(f"[vision_memory] LivingMemory write rejected: status={status} code={code}")
+                    logger.warning(
+                        f"[vision_memory] LivingMemory write rejected: status={status} code={code} "
+                        f"message={str(data.get('message'))[:200]}"
+                    )
                     hints = {
                         404: "LivingMemory 外部 API 未启用（external_api.enabled）或地址/端口不对。",
                         401: "LivingMemory 外部 API Key 无效或已撤销。",
@@ -456,6 +466,10 @@ class VisionMemory(Star):
             description(string): 外貌特征或出处说明（更新时请写完整，会替换原记录）
             aliases(string): 其他叫法，用英文逗号分隔，可为空
         """
+        logger.info(
+            f"[vision_memory] save_character_memory called by model: "
+            f"name={str(name)[:30]!r} work={str(work)[:30]!r}"
+        )
         name = (name or "").strip()[:60]
         work = (work or "").strip()[:80]
         desc = (description or "").strip()[:300]
