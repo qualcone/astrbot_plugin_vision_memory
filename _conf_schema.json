@@ -20,25 +20,9 @@
     "type": "bool",
     "default": true
   },
-  "enable_memory": {
-    "description": "启用长期记忆（角色/作品事实）",
-    "type": "bool",
-    "default": true
-  },
-  "recall_top_k": {
-    "description": "每次最多注入/返回的记忆条数",
-    "type": "int",
-    "default": 3,
-    "slider": {"min": 1, "max": 10, "step": 1}
-  },
-  "max_facts": {
-    "description": "记忆条数上限（超出后淘汰最久未使用的）",
-    "type": "int",
-    "default": 500
-  },
   "guidance_prompt": {
     "description": "追加到系统提示词的行为指引（留空则不追加，不会覆盖原人设）",
     "type": "text",
-    "default": "当用户发来图片，或提到你不熟悉的动漫、游戏角色或表情包时：\n1. 先调用 recall_character 查长期记忆，或回忆自己是否见过。\n2. 仍不确定，就联网搜索一次确认角色名和出处。\n3. 回复里明确说出角色名和作品名；确认无误后调用 remember_character 保存。\n不要对每个问题都搜索，只在遇到不熟悉的角色或作品时搜索。"
+    "default": "当用户发来图片，或提到你不熟悉的动漫、游戏角色或表情包时：\n1. 先尝试回忆是否见过（可调用 recall_long_term_memory 查长期记忆）。\n2. 回忆不起来，就联网搜索一次确认角色名和出处。\n3. 回复里明确说出角色名和作品名；确认无误后调用 memorize_long_term_memory 保存（写明角色名、作品名和外貌特征）。\n不要对每个问题都搜索，只在遇到不熟悉的角色或作品时搜索。"
   }
 }
