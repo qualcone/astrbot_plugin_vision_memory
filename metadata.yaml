@@ -1,0 +1,8 @@
+name: astrbot_plugin_vision_memory
+display_name: 识图与角色记忆
+desc: 用识图模型把图片转成文字交给主模型，并把联网确认过的动漫/游戏角色存入长期记忆。
+short_desc: 图转文 + 角色长期记忆
+version: v0.1.0
+author: qualcone
+repo: https://github.com/qualcone/astrbot_plugin_vision_memory
+astrbot_version: ">=4.9.2"
