@@ -19,6 +19,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -58,12 +59,21 @@ GROUP_OF = {
 }
 
 DEFAULT_GEMINI_PROMPT = (
-    "你是识图助手。根据图片、以图搜图找到的网页信息，以及你读到的网页内容，判断图中的角色（或主体）是谁、出自哪部作品。\n"
+    "你是识图助手。根据图片、以图搜图找到的网页信息，以及你读到的网页内容，判断图中是哪部作品的哪个角色。\n"
     "以图搜图的结果是主要线索：有很多张完全相同的图片、或多个网页指向同一个名字，就足以给出结论。\n"
     "网页打不开时，也依据以图搜图给出的最佳猜测、网络实体、完全相同的图片数量和网页标题来判断。\n"
-    "如实说出你掌握的信息：有候选就给出最可能的，并标明可信度（高/中/低）和依据；几个候选难分时都列出来；"
-    "只有完全没有线索时才写“无法确认”。不要编造网页里没有的内容。\n"
-    "只输出一行：识别结论：角色名 / 作品 / 可信度 / 依据"
+    "如实说出你掌握的信息，不要编造网页里没有的内容。输出三行：\n"
+    "作品：作品名（可信度 高/中/低）；不知道写“未知”\n"
+    "角色：角色名（可信度 高/中/低）；认出了作品但认不准是哪个角色写“未确定”；完全没有线索写“无法确认”\n"
+    "依据：哪个网页或线索的什么信息"
+)
+DEFAULT_MATCH_PROMPT = (
+    "你是识图助手。已知这张图出自某部作品，现在要找出图中是这部作品里的哪个角色。\n"
+    "先联网搜索这部作品的角色列表和设定（维基、萌娘百科等），再对照图中人物的外貌（发色发型、瞳色、服饰、配饰、持物）逐个比对。\n"
+    "只采信能和图片对上的特征，如实标明可信度，不要编造；认不准就列出最像的候选并说明区别。输出三行：\n"
+    "角色：名字（可信度 高/中/低）；认不出写“未确定”\n"
+    "候选：其他可能的角色，没有就写“无”\n"
+    "依据：对上了哪些外貌特征、来自哪里"
 )
 DEFAULT_GUIDANCE = (
     "图片描述里的“识别结论”带有可信度和依据：可信度高可直接采用；中或低请向用户说明不太确定；"
@@ -184,9 +194,9 @@ def _s(v, limit=80) -> str:
     return _clip(str(v).strip(), limit) if v else ""
 
 
-def _gemini_request(base, model, key, proxy, system, ask, image, timeout, url_context=False):
-    """Blocking call to the Gemini REST API. With url_context=True Gemini opens the
-    links in the prompt itself. The key goes only into the x-goog-api-key header
+def _gemini_request(base, model, key, proxy, system, ask, image, timeout, tools=()):
+    """Blocking call to the Gemini REST API. tools may contain "url_context" (Gemini
+    opens the links in the prompt itself) and/or "google_search" (Google Search). The key goes only into the x-goog-api-key header
     of this one request; redirects are not followed.
     Returns (text, [url retrieval statuses])."""
     model = model.strip()
@@ -204,8 +214,8 @@ def _gemini_request(base, model, key, proxy, system, ask, image, timeout, url_co
             }
         ],
     }
-    if url_context:
-        body["tools"] = [{"url_context": {}}]
+    if tools:
+        body["tools"] = [{name: {}} for name in tools]
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
     handlers = [_NoRedirect()]
@@ -283,6 +293,19 @@ def _webdetect(key, image, proxy, timeout):
     if not (labels or ents or pages or full):
         return None
     return {"guess": _s(labels[:2], 80), "entities": [_s(e, 40) for e in ents[:6]], "full": full, "pages": pages}
+
+
+_UNKNOWN = ("未知", "未确定", "无法确认", "不确定", "暂无", "没有", "无")
+
+
+def _field(text: str, label: str) -> str:
+    m = re.search(rf"^[\s*•\-]*{label}\s*[：:]\s*(.+?)\s*$", text or "", re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _known(value: str) -> bool:
+    v = (value or "").strip()
+    return bool(v) and not v.startswith(_UNKNOWN)
 
 
 def _format_found(found) -> str:
@@ -458,7 +481,7 @@ class VisionMemory(Star):
         summary = _format_found(found)
         self._dbg(f"Google Vision 结果:\n{summary}")
 
-        # step 2: a model reads those pages and decides
+        # step 2: a model reads those pages and says which work / character this is
         try:
             conclusion = await self._gemini_read(image, user_text, found, summary, gkey)
         except Exception as e:
@@ -467,42 +490,79 @@ class VisionMemory(Star):
         if not conclusion:
             return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False
 
+        work, char, evidence = _field(conclusion, "作品"), _field(conclusion, "角色"), _field(conclusion, "依据")
+        if work or char:  # structured answer
+            candidates = ""
+            if _known(work) and not _known(char):
+                # step 2b: the work is known but not the character -> match it against the work's cast
+                try:
+                    m_char, candidates, m_evid = await self._gemini_match(image, user_text, work, summary, gkey)
+                except Exception as e:
+                    logger.warning(f"[vision_memory] character matching failed: {type(e).__name__}: {e}")
+                    m_char, candidates, m_evid = "", "", ""
+                if _known(m_char):
+                    char = m_char
+                if m_evid:
+                    evidence = (evidence + "；" if evidence else "") + "角色比对：" + m_evid
+            identified = _known(work) or _known(char)
+            lines = [f"作品：{work or '未知'}", f"角色：{char or '未确定'}"]
+            if _known(candidates):
+                lines.append(f"其他可能：{candidates}")
+            if evidence:
+                lines.append(f"依据：{evidence}")
+            conclusion = "识别结论：\n" + "\n".join(lines)
+        else:  # the model ignored the format: pass its text through
+            identified = "无法确认" not in conclusion
+
         # step 3: the conclusion goes to the main model
-        identified = "无法确认" not in conclusion
         if identified and found["pages"]:
             conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:3])
         elif not identified:  # still hand over what Google found, the main model may make sense of it
             conclusion += "\n以图搜图找到的线索：\n" + summary
         return conclusion, identified
 
-    async def _gemini_read(self, image, user_text, found, summary, key) -> str:
+    async def _gemini_ask(self, key, image, ask, system, chains) -> str:
+        """Call Gemini with the first tool set in `chains`; if the model rejects it
+        (HTTP 400), fall back to the next, lighter one."""
         base = (self._c("gemini_base_url") or GEMINI_DEFAULT_BASE).strip().rstrip("/")
         model = (self._c("gemini_model") or GEMINI_DEFAULT_MODEL).strip()
         proxy = (self._c("gemini_proxy") or "").strip()
         if urlparse(base).scheme not in ("http", "https"):
             raise GeminiError("Gemini 接口地址必须以 http:// 或 https:// 开头")
+        for i, tools in enumerate(chains):
+            try:
+                text, pages = await asyncio.wait_for(
+                    asyncio.to_thread(_gemini_request, base, model, key, proxy, system, ask, image, GEMINI_TIMEOUT, tools),
+                    timeout=GEMINI_TIMEOUT + 5,
+                )
+            except GeminiError as e:
+                if tools and "HTTP 400" in str(e) and i < len(chains) - 1:
+                    logger.warning(f"[vision_memory] Gemini 不接受工具 {list(tools)}：{e}；改用 {list(chains[i + 1])} 重试")
+                    continue
+                raise
+            self._dbg(f"Gemini: 模型={model}，工具={list(tools)} {pages[:6]}；输出: {_clip(text, 600)}")
+            return _clip(text, 600) if text else ""
+        return ""
+
+    async def _gemini_read(self, image, user_text, found, summary, key) -> str:
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
             + "以图搜图找到的信息：\n" + summary
-            + "\n\n请阅读上面的网页，判断图中是谁、出自哪部作品。"
+            + "\n\n请阅读上面的网页，判断图中是哪部作品的哪个角色。"
         )
-        use_pages = bool(found["pages"])
-        try:
-            text, pages = await asyncio.wait_for(
-                asyncio.to_thread(_gemini_request, base, model, key, proxy, DEFAULT_GEMINI_PROMPT, ask, image, GEMINI_TIMEOUT, use_pages),
-                timeout=GEMINI_TIMEOUT + 5,
-            )
-        except GeminiError as e:
-            if not (use_pages and "HTTP 400" in str(e)):
-                raise
-            logger.warning(f"[vision_memory] Gemini 不接受读取网页（URL Context）：{e}；改为只用标题和实体重试")
-            use_pages = False
-            text, pages = await asyncio.wait_for(
-                asyncio.to_thread(_gemini_request, base, model, key, proxy, DEFAULT_GEMINI_PROMPT, ask, image, GEMINI_TIMEOUT, False),
-                timeout=GEMINI_TIMEOUT + 5,
-            )
-        self._dbg(f"Gemini: 模型={model}，读取网页={'是' if use_pages else '否'} {pages[:6]}；输出: {_clip(text, 600)}")
-        return _clip(text, 600) if text else ""
+        chains = [("url_context",), ()] if found["pages"] else [()]
+        return await self._gemini_ask(key, image, ask, DEFAULT_GEMINI_PROMPT, chains)
+
+    async def _gemini_match(self, image, user_text, work, summary, key):
+        """The work is known: have Gemini search the work's cast and match the
+        character by appearance. Returns (character, other candidates, evidence)."""
+        ask = (
+            (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
+            + f"这张图出自作品：{_clip(work, 80)}\n以图搜图找到的信息（可能含有角色名线索）：\n{summary}"
+            + "\n\n请找出图中是这部作品里的哪个角色。"
+        )
+        text = await self._gemini_ask(key, image, ask, DEFAULT_MATCH_PROMPT, [("google_search", "url_context"), ("google_search",)])
+        return _field(text, "角色"), _field(text, "候选"), _field(text, "依据")
 
     # ---- guidance for the main model ----
     def _recent_identified(self, req: ProviderRequest) -> bool:
