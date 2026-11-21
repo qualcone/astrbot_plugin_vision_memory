@@ -41,6 +41,10 @@ PERSONA_NONE = "[%None]"
 MAX_IMAGES = 3  # images identified per message
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
+CACHE_TTL = 3600  # seconds a finished identification is reused for the same image
+CACHE_MAX = 64
+TAG_PREFIX = "[识别："  # compact, persisted marker of an identification, e.g. [识别：灵梦 / 东方Project]
+MAX_NOTE_CHARS = 700  # cap on the text added to the user message (it is saved in the chat history)
 CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier identification
 
 # Settings live in groups (menus in the AstrBot panel), in processing order.
@@ -288,7 +292,7 @@ def _webdetect(key, image, proxy, timeout):
         {"title": _s(p.get("pageTitle"), 80), "url": _s(p.get("url"), 200)}
         for p in wd.get("pagesWithMatchingImages") or []
         if isinstance(p, dict) and p.get("url")
-    ][:6]
+    ][:4]
     full = len(wd.get("fullMatchingImages") or [])
     if not (labels or ents or pages or full):
         return None
@@ -306,6 +310,17 @@ def _field(text: str, label: str) -> str:
 def _known(value: str) -> bool:
     v = (value or "").strip()
     return bool(v) and not v.startswith(_UNKNOWN)
+
+
+def _temp_part(text: str):
+    """A user-message part for this request only: AstrBot leaves parts marked as
+    temporary out of the saved chat history. None if this AstrBot cannot do that."""
+    try:
+        from astrbot.core.agent.message import TextPart
+
+        return TextPart(text=text).mark_as_temp()
+    except Exception:
+        return None
 
 
 def _format_found(found) -> str:
@@ -341,6 +356,7 @@ class VisionMemory(Star):
         self._write_lock = asyncio.Lock()
         self._get_broken = False
         self._warned = set()
+        self._cache = {}
         self._log_status()
 
     # ---- config / logging ----
@@ -415,7 +431,8 @@ class VisionMemory(Star):
             sp_text = req.system_prompt or ""
             self._dbg(
                 "—— 即将发给主模型的最终请求 ——\n"
-                f"用户消息（{len(req.prompt or '')}字）: {_clip(req.prompt, 1500)}\n"
+                f"用户消息（{len(req.prompt or '')}字，会保存进聊天历史）: {_clip(req.prompt, 1500)}\n"
+                f"仅本次请求的附加内容（不保存进历史）: {_clip(' | '.join(str(getattr(p, 'text', p)) for p in (getattr(req, 'extra_user_content_parts', None) or [])), 1500)}\n"
                 f"随消息的图片数: {len(req.image_urls or [])}；历史消息条数: {len(getattr(req, 'contexts', None) or [])}\n"
                 f"系统提示词总长: {len(sp_text)}字；末尾 600 字: {_clip(sp_text[-600:], 700)}\n"
                 f"可用工具({len(tools)}): {tools}\n"
@@ -435,32 +452,59 @@ class VisionMemory(Star):
             self._warn_once("nokeys", "[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和“Gemini 密钥”，图片将原样传给主模型。")
             return False
         user_text = req.prompt or ""
-        parts, kept = [], []
+        parts, kept, tags = [], [], []
         for i, url in enumerate(list(req.image_urls), 1):
             if i > MAX_IMAGES:
                 parts.append(f"[图片{i}] (超过 {MAX_IMAGES} 张上限，已跳过)")
                 kept.append(url)
                 continue
             t0 = time.monotonic()
-            text, identified = await self._identify_one(url, user_text, vkey, gkey)
+            text, identified, tag = await self._identify_one(url, user_text, vkey, gkey)
+            if text is None:  # skipped on purpose (e.g. animated sticker): nothing is added
+                kept.append(url)
+                continue
             self._dbg(f"图片{i} [{_describe_image(url)}] 耗时 {time.monotonic() - t0:.1f}s，识别结果: {_clip(text, 800)}（已识别={identified}）")
             parts.append(f"[图片{i}] {text}")
+            if identified and tag:
+                tags.append(tag)
             if not identified:
                 kept.append(url)
         req.image_urls = kept
+        if not parts:
+            return False
         block = _CAPTION_HEADER + "\n" + "\n".join(parts)
         base = (req.prompt or "").rstrip()
-        req.prompt = (base + "\n\n" + block) if base else block
+        part = _temp_part(block)
+        if part is not None:
+            # The full text is for this request only (not saved in the chat history, so it
+            # is not re-sent with every later turn). Only a short tag is persisted: it keeps
+            # the name in the history and lets LivingMemory's recall search by it.
+            if getattr(req, "extra_user_content_parts", None) is None:
+                req.extra_user_content_parts = []
+            req.extra_user_content_parts.append(part)
+            if tags:
+                tag_line = TAG_PREFIX + "；".join(tags) + "]"
+                req.prompt = (base + "\n" + tag_line) if base else tag_line
+        else:  # this AstrBot cannot do temporary parts: fall back to plain (saved) text
+            req.prompt = (base + "\n\n" + block) if base else block
         logger.info(f"[vision_memory] identified {len(parts) - len(kept)}/{len(parts)} image(s); {len(kept)} kept for the main model")
         return True
 
     async def _identify_one(self, url, user_text, vkey, gkey):
-        """Returns (text for the main model, identified?). Never raises."""
+        """Returns (text for the main model, identified?, short tag). Never raises."""
         try:
             image = await asyncio.wait_for(asyncio.to_thread(_read_image, url, IMAGE_MAX_BYTES, 20), timeout=25)
         except Exception as e:
             logger.warning(f"[vision_memory] image could not be loaded: {type(e).__name__}: {e}")
-            return "(图片无法读取，未识别)", False
+            return "(图片无法读取，未识别)", False, ""
+        if _sniff_mime(image) == "image/gif":
+            self._dbg("GIF 动图（多半是表情包），跳过识别以节省调用")
+            return None, False, ""
+        ckey = hashlib.sha1(image).hexdigest()
+        hit = self._cache.get(ckey)
+        if hit and time.monotonic() - hit[0] < CACHE_TTL:
+            self._dbg("同一张图一小时内已识别过，直接使用上次的结果")
+            return hit[1], True, hit[2]
 
         # step 1: pages on the web that contain this image
         vproxy = (self._c("reverse_proxy") or "").strip()
@@ -468,16 +512,16 @@ class VisionMemory(Star):
             found = await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30)
         except ReverseError as e:
             logger.warning(f"[vision_memory] {e}")
-            return "以图搜图失败，无法确认。", False
+            return "以图搜图失败，无法确认。", False, ""
         except asyncio.TimeoutError:
             logger.warning("[vision_memory] Google Vision timed out")
-            return "以图搜图超时，无法确认。", False
+            return "以图搜图超时，无法确认。", False, ""
         except Exception as e:
             logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
-            return "以图搜图失败，无法确认。", False
+            return "以图搜图失败，无法确认。", False, ""
         if not found:
             self._dbg("Google Vision 没有找到相关网页")
-            return "以图搜图没有找到相关网页，无法确认。", False
+            return "以图搜图没有找到相关网页，无法确认。", False, ""
         summary = _format_found(found)
         self._dbg(f"Google Vision 结果:\n{summary}")
 
@@ -488,7 +532,7 @@ class VisionMemory(Star):
             logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
             conclusion = ""
         if not conclusion:
-            return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False
+            return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
 
         work, char, evidence = _field(conclusion, "作品"), _field(conclusion, "角色"), _field(conclusion, "依据")
         if work or char:  # structured answer
@@ -505,6 +549,7 @@ class VisionMemory(Star):
                 if m_evid:
                     evidence = (evidence + "；" if evidence else "") + "角色比对：" + m_evid
             identified = _known(work) or _known(char)
+            tag = _clip(" / ".join(x for x in (char, work) if _known(x)), 80)
             lines = [f"作品：{work or '未知'}", f"角色：{char or '未确定'}"]
             if _known(candidates):
                 lines.append(f"其他可能：{candidates}")
@@ -513,13 +558,20 @@ class VisionMemory(Star):
             conclusion = "识别结论：\n" + "\n".join(lines)
         else:  # the model ignored the format: pass its text through
             identified = "无法确认" not in conclusion
+            tag = ""
 
-        # step 3: the conclusion goes to the main model
+        # step 3: the conclusion goes to the main model. This text is saved in the
+        # chat history and re-sent with every later turn, so it is kept short.
+        conclusion = _clip(conclusion, MAX_NOTE_CHARS)
         if identified and found["pages"]:
-            conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:3])
+            conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:2])
         elif not identified:  # still hand over what Google found, the main model may make sense of it
-            conclusion += "\n以图搜图找到的线索：\n" + summary
-        return conclusion, identified
+            conclusion += "\n以图搜图找到的线索：\n" + _clip(summary, 500)
+        if identified:
+            if len(self._cache) >= CACHE_MAX:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[ckey] = (time.monotonic(), conclusion, tag)
+        return conclusion, identified, tag
 
     async def _gemini_ask(self, key, image, ask, system, chains) -> str:
         """Call Gemini with the first tool set in `chains`; if the model rejects it
@@ -567,8 +619,10 @@ class VisionMemory(Star):
     # ---- guidance for the main model ----
     def _recent_identified(self, req: ProviderRequest) -> bool:
         for m in (getattr(req, "contexts", None) or [])[-CONTEXT_LOOKBACK:]:
-            if isinstance(m, dict) and _CAPTION_HEADER in _text_of(m.get("content")):
-                return True
+            if isinstance(m, dict):
+                t = _text_of(m.get("content"))
+                if _CAPTION_HEADER in t or TAG_PREFIX in t:
+                    return True
         return False
 
     def _apply_guidance(self, req: ProviderRequest, processed: bool) -> None:
