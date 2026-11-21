@@ -703,8 +703,13 @@ class VisionMemory(Star):
         return bool((self._c("gemini_api_key") or "").strip())
 
     def _gv_on(self) -> bool:
-        """Source A usable: switched on, key filled, and a step-2 model to read its pages."""
-        return bool(self._c("gv_enable", True)) and bool((self._c("gv_api_key") or "").strip()) and self._reader_ready()
+        """Source A switched on and its key filled (Google is asked)."""
+        return bool(self._c("gv_enable", True)) and bool((self._c("gv_api_key") or "").strip())
+
+    def _gv_usable(self) -> bool:
+        """Source A can identify on its own: it also needs a step-2 model to read its pages.
+        Without one, Google is still asked when source B is usable, to cross-check B."""
+        return self._gv_on() and self._reader_ready()
 
     def _verify_on(self) -> bool:
         """Source B usable: switched on and the three required fields filled."""
@@ -744,7 +749,14 @@ class VisionMemory(Star):
             has = lambda k: "已填" if (self._c(k) or "").strip() else "未填"
             reader = self._reader()
             who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}" if reader == "astrbot" else f"Gemini 密钥={has('gemini_api_key')}"
-            gv = "关" if not self._c("gv_enable", True) else ("开" if (self._c("gv_api_key") or "").strip() else "开但密钥未填")
+            if not self._c("gv_enable", True):
+                gv = "关"
+            elif not (self._c("gv_api_key") or "").strip():
+                gv = "开但密钥未填"
+            elif self._reader_ready():
+                gv = "开"
+            else:
+                gv = "开（没有第二步的模型，只用来交叉验证联网大模型）" if self._verify_on() else "开但缺第二步的模型"
             vf = "关" if not self._c("verify_enable", True) else ("开" if self._verify_ready() else "开但未配置")
             logger.info(
                 "[vision_memory] 已加载：Google 以图搜图=%s，联网大模型=%s，第二步=%s，%s，联网搜索资料=%s，LivingMemory 密钥=%s，行为指引=%s"
@@ -755,7 +767,7 @@ class VisionMemory(Star):
                     "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
                 )
             )
-            if not (self._gv_on() or self._verify_on()):
+            if not (self._gv_usable() or self._verify_on()):
                 logger.warning(self._missing_msg())
         except Exception as e:
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
@@ -764,7 +776,7 @@ class VisionMemory(Star):
         second = "第二步选择的 AstrBot 提供商" if self._reader() == "astrbot" else "第二步的 Gemini 密钥"
         return (
             "[vision_memory] 图片识别需要至少启用并配好一个第一步来源：A. Google 以图搜图（填 Google Vision 密钥，"
-            f"并配好{second}），或 B. 联网大模型（填接口地址、Key、模型）。否则图片会原样传给主模型。"
+            f"并配好{second}来读取网页），或 B. 联网大模型（填接口地址、Key、模型）。否则图片会原样传给主模型。"
         )
 
     @staticmethod
@@ -820,7 +832,7 @@ class VisionMemory(Star):
         the main model can still look at them. Returns True if anything was added."""
         vkey = (self._c("gv_api_key") or "").strip()
         gkey = (self._c("gemini_api_key") or "").strip()
-        if not (self._gv_on() or self._verify_on()):
+        if not (self._gv_usable() or self._verify_on()):
             self._warn_once("nokeys", self._missing_msg())
             return False
         user_text = req.prompt or ""
@@ -881,7 +893,9 @@ class VisionMemory(Star):
         # step 1: two independent, optional sources run at the same time:
         #   A. Google Cloud Vision: web pages that contain this image
         #   B. a vendor model with built-in web search: identifies the image on its own
-        gv_on, v_on = self._gv_on(), self._verify_on()
+        v_on = self._verify_on()
+        reader_ok = self._reader_ready()
+        gv_on = self._gv_on() and (reader_ok or v_on)  # without a step-2 model Google only cross-checks B
         vproxy = (self._c("reverse_proxy") or "").strip()
 
         async def source_a():
@@ -915,7 +929,7 @@ class VisionMemory(Star):
         raw = ""  # the model's own text, passed through when it ignores the answer format
         obj = src = setting = evidence = candidates = ""
         structured = False
-        if found:
+        if found and reader_ok:
             # step 2: a model reads those pages and says who / what this is
             try:
                 conclusion = await self._read(image, user_text, found, summary, gkey)
@@ -967,6 +981,15 @@ class VisionMemory(Star):
             if v["evidence"]:
                 evidence = (evidence + "；" if evidence else "") + "联网大模型：" + v["evidence"]
 
+        corroborated = False
+        if v and found and not reader_ok and _known(obj):
+            # no step-2 model: Google's pages/entities can still confirm B's answer
+            names = [found["guess"], *found["entities"], *[p["title"] for p in found["pages"]]]
+            core = re.split(r"[（(]", obj)[0].strip().lower()
+            if core and any(core in (n or "").lower() for n in names):
+                corroborated = True
+                evidence = (evidence + "；" if evidence else "") + "Google 以图搜图的网页或实体里也出现了这个名字"
+
         if structured:
             identified = _known(obj) or _known(src)
             tag = _clip(" / ".join(x for x in (obj, src) if _known(x)), 80)
@@ -988,7 +1011,7 @@ class VisionMemory(Star):
         # the conclusion goes to the main model. This text is saved in the chat history and
         # re-sent with every later turn, so it is kept short.
         conclusion = _clip(conclusion, MAX_NOTE_CHARS)
-        if identified and found and found["pages"]:
+        if identified and found and found["pages"] and (reader_ok or corroborated):
             conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:2])
         elif not identified and summary:  # still hand over what Google found, the main model may make sense of it
             conclusion += "\n以图搜图找到的线索：\n" + _clip(summary, 500)
