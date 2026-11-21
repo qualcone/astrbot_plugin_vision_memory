@@ -1,81 +1,7 @@
 {
-  "basic": {
-    "description": "基础设置",
-    "type": "object",
-    "items": {
-      "enable_caption": {
-        "description": "图片转述（总开关）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，用下方的识图模型处理消息里的图片，再把文字结果交给主模型。关闭则原图原样传给主模型。"
-      },
-      "caption_provider": {
-        "description": "识图模型",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "选择用于识图的提供商（AstrBot 里配置的）。联网方式选“Gemini 直连”时不使用。留空则不转述。"
-      },
-      "search_mode": {
-        "description": "识图时的联网方式",
-        "type": "string",
-        "options": [
-          "tools",
-          "gemini_direct",
-          "off"
-        ],
-        "labels": [
-          "搜索工具（如 Tavily）",
-          "Gemini 直连（Google 搜索）",
-          "不联网"
-        ],
-        "default": "tools",
-        "hint": "搜索工具：用上面选的 AstrBot 识图模型，让它调用 AstrBot 已启用的搜索工具（如 Tavily）和记忆召回，模型需支持函数调用。Gemini 直连：插件直接调用 Gemini（不经过 AstrBot 的提供商），启用 Google 搜索，需在“Gemini 直连”里填 Key。不联网：直接描述，准确率较低。"
-      },
-      "enable_guidance": {
-        "description": "追加行为指引",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，在需要时给主模型的系统提示词末尾追加一段很短的指引，要求不确定时先查记忆、再联网，不要编造。详细触发规则见“指引高级设置”。"
-      }
-    }
-  },
-  "gemini": {
-    "description": "Gemini 直连（仅联网方式选“Gemini 直连”时使用）",
-    "type": "object",
-    "hint": "此方式下插件直接请求 Gemini 接口，不走 AstrBot 的提供商；图片和 Key 会发往下面的接口地址。",
-    "items": {
-      "gemini_api_key": {
-        "description": "Gemini API Key",
-        "type": "string",
-        "default": "",
-        "secret": true,
-        "hint": "在 Google AI Studio 创建。只保存在本插件配置中，不写入日志。"
-      },
-      "gemini_model": {
-        "description": "模型",
-        "type": "string",
-        "default": "gemini-3.5-flash",
-        "hint": "需支持图片输入和 Google 搜索，如 gemini-3.5-flash。填写你的 Key 能调用的模型名。"
-      },
-      "gemini_base_url": {
-        "description": "接口地址",
-        "type": "string",
-        "default": "https://generativelanguage.googleapis.com",
-        "hint": "官方地址一般不用改；如使用反向代理，改成代理地址（不含 /v1beta）。Key 会发往此地址，请只填可信地址。"
-      },
-      "gemini_proxy": {
-        "description": "网络代理（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "访问 Gemini 需要代理时填写，如 http://127.0.0.1:7890。留空则使用系统环境变量中的代理（如有）。"
-      }
-    }
-  },
   "reverse": {
-    "description": "以图搜图（可选）",
+    "description": "① 以图搜图（可选，默认关闭）",
     "type": "object",
-    "hint": "用图片本身去反查（不是文字搜索）。图片会被上传到所启用的服务，默认关闭。SauceNAO 和 trace.moe 擅长插画与动画截图，Google 网页匹配适用范围更广。",
     "items": {
       "reverse_enable": {
         "description": "启用以图搜图",
@@ -115,42 +41,104 @@
         "default": "",
         "hint": "访问 SauceNAO / trace.moe 需要代理时填写，如 http://127.0.0.1:7890。"
       }
-    }
+    },
+    "hint": "用图片本身去反查（不是文字搜索）。图片会被上传到所启用的服务，默认关闭。SauceNAO 和 trace.moe 擅长插画与动画截图，Google 网页匹配适用范围更广。"
   },
-  "memory": {
-    "description": "长期记忆（LivingMemory）",
+  "caption": {
+    "description": "② 识图",
     "type": "object",
-    "hint": "写入角色记忆所需。需先在 LivingMemory 启用 external_api，并用 /lmem apikey 创建同时具备 read 和 write 权限的 Key。",
     "items": {
-      "lm_api_url": {
-        "description": "LivingMemory 外部 API 地址",
-        "type": "string",
-        "default": "http://127.0.0.1:7801",
-        "hint": "需在 LivingMemory 中启用 external_api.enabled。默认端口 7801、仅监听本机。请保持本机地址；Key 会发送到该地址，不要填不信任的地址。"
+      "enable_caption": {
+        "description": "图片转述（总开关）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，用下方的识图模型处理消息里的图片，再把文字结果交给主模型。关闭则原图原样传给主模型。"
       },
-      "lm_api_key": {
-        "description": "LivingMemory 外部 API Key",
+      "caption_provider": {
+        "description": "识图模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "选择用于识图的提供商（AstrBot 里配置的）。联网方式选“Gemini 直连”时不使用。留空则不转述。"
+      },
+      "search_mode": {
+        "description": "识图时的联网方式",
+        "type": "string",
+        "options": [
+          "tools",
+          "gemini_direct",
+          "off"
+        ],
+        "labels": [
+          "搜索工具（如 Tavily）",
+          "Gemini 直连（Google 搜索）",
+          "不联网"
+        ],
+        "default": "tools",
+        "hint": "搜索工具：用上面选的 AstrBot 识图模型，让它调用 AstrBot 已启用的搜索工具（如 Tavily）和记忆召回，模型需支持函数调用。Gemini 直连：插件直接调用 Gemini（不经过 AstrBot 的提供商），启用 Google 搜索，需在“Gemini 直连”里填 Key。不联网：直接描述，准确率较低。"
+      }
+    },
+    "hint": "先把图片交给识图模型生成文字描述，再交给主模型。日常只需要在这里选好识图模型和联网方式。"
+  },
+  "gemini": {
+    "description": "③ Gemini 直连（仅联网方式选“Gemini 直连”时使用）",
+    "type": "object",
+    "items": {
+      "gemini_api_key": {
+        "description": "Gemini API Key",
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "以 lm_ 开头，需同时具备 read 和 write 权限（read 用于检查已有记忆以便更新而不是重复新增）。在 LivingMemory 中用 /lmem apikey 创建。"
+        "hint": "在 Google AI Studio 创建。只保存在本插件配置中，不写入日志。"
       },
-      "memory_scope": {
-        "description": "写入的记忆范围",
+      "gemini_model": {
+        "description": "模型",
         "type": "string",
-        "default": "session",
-        "options": [
-          "session",
-          "global"
-        ],
-        "hint": "session：写入当前会话范围（LivingMemory 默认的兼容/会话模式能召回）；global：写入全局范围（LivingMemory 的范围模式为 global 时使用）。"
+        "default": "gemini-3.5-flash",
+        "hint": "需支持图片输入和 Google 搜索，如 gemini-3.5-flash。填写你的 Key 能调用的模型名。"
+      },
+      "gemini_base_url": {
+        "description": "接口地址",
+        "type": "string",
+        "default": "https://generativelanguage.googleapis.com",
+        "hint": "官方地址一般不用改；如使用反向代理，改成代理地址（不含 /v1beta）。Key 会发往此地址，请只填可信地址。"
+      },
+      "gemini_proxy": {
+        "description": "网络代理（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "访问 Gemini 需要代理时填写，如 http://127.0.0.1:7890。留空则使用系统环境变量中的代理（如有）。"
+      },
+      "gemini_read_pages": {
+        "description": "让 Gemini 读取反查到的网页",
+        "type": "bool",
+        "default": true,
+        "hint": "以图搜图找到含这张图的网页后，让 Gemini 自己打开这些链接（URL Context）读内容再判断是谁。需要先开启“以图搜图”。若 Gemini 不支持会自动退回不读取。"
       }
-    }
+    },
+    "hint": "此方式下插件直接请求 Gemini 接口，不走 AstrBot 的提供商；图片和 Key 会发往下面的接口地址。"
   },
   "caption_advanced": {
-    "description": "识图高级设置",
+    "description": "④ 识图高级设置",
     "type": "object",
     "items": {
+      "max_images": {
+        "description": "单条消息最多转述的图片数",
+        "type": "int",
+        "default": 4,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "超出的图片会被跳过并在文字中注明，用于控制识图模型调用次数与费用。"
+      },
+      "max_image_mb": {
+        "description": "本地图片大小上限（MB）",
+        "type": "int",
+        "default": 10,
+        "hint": "仅对本地文件和 base64 图片生效，超出则跳过；远程链接图片的大小由服务商限制。"
+      },
       "caption_search_prompt": {
         "description": "联网核实模式的系统提示词",
         "type": "text",
@@ -184,23 +172,6 @@
         "default": "请用中文简要描述图片：人物外貌、画风、画面中的文字。认不出的角色不要猜名字。",
         "hint": "仅“不联网”方式使用，也作为联网失败时的备用。"
       },
-      "replace_images": {
-        "description": "转述后移除原图",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，主模型只接收文字描述，由识图模型统一负责看图。关闭后，原图会与描述一并传给主模型（仅在主模型本身支持图片输入时有意义）。"
-      },
-      "max_images": {
-        "description": "单条消息最多转述的图片数",
-        "type": "int",
-        "default": 4,
-        "slider": {
-          "min": 1,
-          "max": 20,
-          "step": 1
-        },
-        "hint": "超出的图片会被跳过并在文字中注明，用于控制识图模型调用次数与费用。"
-      },
       "caption_timeout": {
         "description": "单张图片转述超时（秒）",
         "type": "int",
@@ -213,18 +184,24 @@
         "default": 800,
         "hint": "超出部分会被截断，用于控制主模型的 token 消耗。范围 100–4000。"
       },
-      "max_image_mb": {
-        "description": "本地图片大小上限（MB）",
-        "type": "int",
-        "default": 10,
-        "hint": "仅对本地文件和 base64 图片生效，超出则跳过；远程链接图片的大小由服务商限制。"
+      "replace_images": {
+        "description": "转述后移除原图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，主模型只接收文字描述，由识图模型统一负责看图。关闭后，原图会与描述一并传给主模型（仅在主模型本身支持图片输入时有意义）。"
       }
     }
   },
-  "guidance_advanced": {
-    "description": "指引高级设置",
+  "guidance": {
+    "description": "⑤ 行为指引",
     "type": "object",
     "items": {
+      "enable_guidance": {
+        "description": "追加行为指引",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，在需要时给主模型追加指引；什么时候追加由下面的“指引注入时机”和“触发关键词”决定。"
+      },
       "guidance_mode": {
         "description": "指引注入时机",
         "type": "string",
@@ -267,10 +244,41 @@
         "default": "遇到图片或动漫、游戏角色相关的问题：图片描述里的“识别结论”若有依据可直接采用；写着“无法确认”或你不确定时，先用 recall_long_term_memory 查记忆，查不到就联网搜索，不要凭印象回答。核实后用 save_character_memory 保存（记忆里已有但不清晰时同样调用，会更新原记录）。无关话题不必搜索。",
         "hint": "引用了本插件的 save_character_memory 和 LivingMemory 的 recall_long_term_memory；联网搜索依赖 AstrBot 的 Web Search。升级后已保存的旧提示词不会自动更新，可点“恢复默认”。"
       }
-    }
+    },
+    "hint": "给主模型的系统提示词末尾追加一段很短的指引，要求不确定时先查记忆、再联网，核实后保存。"
+  },
+  "memory": {
+    "description": "⑥ 长期记忆（LivingMemory）",
+    "type": "object",
+    "items": {
+      "lm_api_url": {
+        "description": "LivingMemory 外部 API 地址",
+        "type": "string",
+        "default": "http://127.0.0.1:7801",
+        "hint": "需在 LivingMemory 中启用 external_api.enabled。默认端口 7801、仅监听本机。请保持本机地址；Key 会发送到该地址，不要填不信任的地址。"
+      },
+      "lm_api_key": {
+        "description": "LivingMemory 外部 API Key",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "以 lm_ 开头，需同时具备 read 和 write 权限（read 用于检查已有记忆以便更新而不是重复新增）。在 LivingMemory 中用 /lmem apikey 创建。"
+      },
+      "memory_scope": {
+        "description": "写入的记忆范围",
+        "type": "string",
+        "default": "session",
+        "options": [
+          "session",
+          "global"
+        ],
+        "hint": "session：写入当前会话范围（LivingMemory 默认的兼容/会话模式能召回）；global：写入全局范围（LivingMemory 的范围模式为 global 时使用）。"
+      }
+    },
+    "hint": "写入角色记忆所需。需先在 LivingMemory 启用 external_api，并用 /lmem apikey 创建同时具备 read 和 write 权限的 Key。"
   },
   "debug": {
-    "description": "调试",
+    "description": "⑦ 调试",
     "type": "object",
     "items": {
       "log_caption": {

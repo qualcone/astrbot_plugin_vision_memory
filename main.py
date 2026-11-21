@@ -43,13 +43,13 @@ DEFAULT_SEARCH_PROMPT = (
     "你是识图助手。你对角色的第一印象经常是错的，所以必须联网搜索，以搜索结果为准。\n"
     "先看图提取外貌特征和画面文字，用它们联网搜索（可先用 recall_long_term_memory 查记忆）；"
     "结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
-    "如果提供了以图搜图结果且相似度高，以它为准。\n"
+    "如果提供了以图搜图结果（含这张图的网页链接），先读这些网页的内容（可用网页读取工具打开链接）来判断是谁，以网页信息为准。\n"
     "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
 )
 DEFAULT_GEMINI_PROMPT = (
     "你是识图助手。你对角色的第一印象经常是错的，所以必须用 Google 搜索核实，以搜索结果为准。\n"
     "先看图提取外貌特征和画面文字，再搜索；结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
-    "如果提供了以图搜图结果且相似度高，以它为准。\n"
+    "如果提供了以图搜图结果（含这张图的网页链接），先读取这些网页的内容来判断是谁，以网页信息为准。\n"
     "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
 )
 _FORCE_SEARCH = "你刚才没有调用联网搜索工具。请先用图中特征联网搜索，再按要求输出。"
@@ -121,37 +121,55 @@ def _oversize_reason(url: str, max_mb: int) -> str:
 # Settings live in groups (secondary menus in the AstrBot panel). Flat keys from
 # older versions are still read as a fallback and are migrated on startup.
 GROUP_OF = {
-    "enable_caption": "basic",
-    "caption_provider": "basic",
-    "search_mode": "basic",
-    "enable_guidance": "basic",
-    "gemini_api_key": "gemini",
-    "gemini_model": "gemini",
-    "gemini_base_url": "gemini",
-    "gemini_proxy": "gemini",
+    # 1. reverse image search (runs first)
     "reverse_enable": "reverse",
     "saucenao_api_key": "reverse",
     "gv_api_key": "reverse",
     "use_tracemoe": "reverse",
     "reverse_min_similarity": "reverse",
     "reverse_proxy": "reverse",
-    "lm_api_url": "memory",
-    "lm_api_key": "memory",
-    "memory_scope": "memory",
-    "caption_prompt": "caption_advanced",
+    # 2. captioning
+    "enable_caption": "caption",
+    "caption_provider": "caption",
+    "search_mode": "caption",
+    # 3. direct Gemini (a captioning method)
+    "gemini_api_key": "gemini",
+    "gemini_model": "gemini",
+    "gemini_base_url": "gemini",
+    "gemini_proxy": "gemini",
+    "gemini_read_pages": "gemini",
+    # 4. captioning, advanced
+    "max_images": "caption_advanced",
+    "max_image_mb": "caption_advanced",
     "caption_search_prompt": "caption_advanced",
     "caption_search_tools": "caption_advanced",
     "caption_search_steps": "caption_advanced",
     "caption_search_timeout": "caption_advanced",
-    "replace_images": "caption_advanced",
-    "max_images": "caption_advanced",
+    "caption_prompt": "caption_advanced",
     "caption_timeout": "caption_advanced",
     "max_caption_chars": "caption_advanced",
-    "max_image_mb": "caption_advanced",
+    "replace_images": "caption_advanced",
+    # 5. guidance for the main model
+    "enable_guidance": "guidance",
+    "guidance_mode": "guidance",
+    "guidance_keywords": "guidance",
+    "guidance_prompt": "guidance",
+    # 6. long-term memory write
+    "lm_api_url": "memory",
+    "lm_api_key": "memory",
+    "memory_scope": "memory",
+    # 7. debug
+    "log_caption": "debug",
+}
+# group names used by v0.5.x / v0.6.0, still read (and migrated) for upgrades
+OLD_GROUP_OF = {
+    "enable_caption": "basic",
+    "caption_provider": "basic",
+    "search_mode": "basic",
+    "enable_guidance": "basic",
     "guidance_mode": "guidance_advanced",
     "guidance_keywords": "guidance_advanced",
     "guidance_prompt": "guidance_advanced",
-    "log_caption": "debug",
 }
 SEARCH_MODES = ("tools", "gemini_direct", "off")
 
@@ -227,7 +245,7 @@ def _read_image(url: str, max_bytes: int, timeout: int) -> bytes:
     return data
 
 
-def _gemini_request(base, model, key, proxy, system, ask, image, timeout):
+def _gemini_request(base, model, key, proxy, system, ask, image, timeout, url_context=False):
     """Blocking call to the Gemini REST API with Google Search grounding.
     The key goes only into the x-goog-api-key header of this one request and
     redirects are not followed. Returns (text, search_queries, source_titles)."""
@@ -245,7 +263,7 @@ def _gemini_request(base, model, key, proxy, system, ask, image, timeout):
                 ],
             }
         ],
-        "tools": [{"google_search": {}}],
+        "tools": [{"google_search": {}}] + ([{"url_context": {}}] if url_context else []),
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
@@ -287,7 +305,12 @@ def _gemini_request(base, model, key, proxy, system, ask, image, timeout):
         for c in (meta.get("groundingChunks") or [])
         if isinstance(c, dict)
     ]
-    return text, queries, [x for x in sources if x]
+    pages = [
+        f"{str(u.get('urlRetrievalStatus', '')).replace('URL_RETRIEVAL_STATUS_', '')} {_clip(u.get('retrievedUrl', ''), 100)}"
+        for u in ((cand.get("urlContextMetadata") or {}).get("urlMetadata") or [])
+        if isinstance(u, dict)
+    ]
+    return text, queries, [x for x in sources if x], pages
 
 
 SAUCENAO_URL = "https://saucenao.com/search.php"
@@ -411,7 +434,7 @@ def _webdetect(key, image, proxy, timeout):
     pages = [p for p in wd.get("pagesWithMatchingImages") or [] if isinstance(p, dict) and p.get("url")]
     if full:
         bits.append(f"找到 {len(full)} 张完全相同的图片")
-    for p in pages[:3]:
+    for p in pages[:5]:
         bits.append(f"网页：{_s(p.get('pageTitle'), 50)} {_s(p.get('url'), 120)}".strip())
     if not bits:
         return []
@@ -471,10 +494,10 @@ class VisionMemory(Star):
     # ---- config access ----
     def _c(self, key, default=None):
         """Read a setting from its group; fall back to a flat key (older versions)."""
-        group = GROUP_OF.get(key)
-        g = self.config.get(group) if group else None
-        if isinstance(g, dict) and key in g:
-            return g[key]
+        for group in (GROUP_OF.get(key), OLD_GROUP_OF.get(key)):
+            g = self.config.get(group) if group else None
+            if isinstance(g, dict) and key in g:
+                return g[key]
         return self.config.get(key, default)
 
     def _migrate_legacy(self) -> None:
@@ -487,7 +510,12 @@ class VisionMemory(Star):
                     g[key] = self.config[key]
                     del self.config[key]
                     moved = True
-            g = self.config.get("basic")
+            for key, old in OLD_GROUP_OF.items():  # v0.5.x / v0.6.0 group layout
+                og, ng = self.config.get(old), self.config.get(GROUP_OF[key])
+                if isinstance(og, dict) and key in og and isinstance(ng, dict):
+                    ng[key] = og.pop(key)
+                    moved = True
+            g = self.config.get("caption")
             if "caption_use_search" in self.config and isinstance(g, dict):
                 if self.config["caption_use_search"] is False:
                     g["search_mode"] = "off"
@@ -681,7 +709,7 @@ class VisionMemory(Star):
         system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_SEARCH_PROMPT
         ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
         if hint:
-            ask += f"\n\n以图搜图结果（相似度越高越可信，仍需结合图片核实）：\n{hint}"
+            ask += f"\n\n以图搜图结果（可能含有这张图的网页链接，请阅读网页内容后判断，仍需结合图片核实）：\n{hint}"
         calls = []
         hooks = self._tool_hooks(calls)
         started = time.monotonic()
@@ -774,15 +802,26 @@ class VisionMemory(Star):
         system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_GEMINI_PROMPT
         ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
         if hint:
-            ask += f"\n\n以图搜图结果（相似度越高越可信，仍需结合图片核实）：\n{hint}"
+            ask += f"\n\n以图搜图结果（可能含有这张图的网页链接，请阅读网页内容后判断，仍需结合图片核实）：\n{hint}"
         try:
             image = await asyncio.wait_for(
                 asyncio.to_thread(_read_image, url, max_mb * 1024 * 1024, 20), timeout=25
             )
-            text, queries, sources = await asyncio.wait_for(
-                asyncio.to_thread(_gemini_request, base, model, key, proxy, system, ask, image, timeout),
-                timeout=timeout + 5,
-            )
+            read_pages = bool(self._c("gemini_read_pages", True)) and "http" in (hint or "")
+            try:
+                text, queries, sources, pages = await asyncio.wait_for(
+                    asyncio.to_thread(_gemini_request, base, model, key, proxy, system, ask, image, timeout, read_pages),
+                    timeout=timeout + 5,
+                )
+            except GeminiError as e:
+                if not (read_pages and "HTTP 400" in str(e)):
+                    raise
+                logger.warning(f"[vision_memory] Gemini 不接受读取网页（URL Context）：{e}；改为不读取网页重试")
+                read_pages = False
+                text, queries, sources, pages = await asyncio.wait_for(
+                    asyncio.to_thread(_gemini_request, base, model, key, proxy, system, ask, image, timeout, False),
+                    timeout=timeout + 5,
+                )
         except asyncio.TimeoutError:
             logger.warning(f"[vision_memory] Gemini direct call timed out after {timeout}s")
             return ""
@@ -797,7 +836,8 @@ class VisionMemory(Star):
             return ""
         self._dbg(
             f"Gemini 直连: 模型={model} 地址={base}{' 代理=已设置' if proxy else ''}；"
-            f"Google 实际搜索词={queries or '(无，模型未触发搜索)'}；参考来源={sources[:5]}"
+            f"Google 实际搜索词={queries or '(无，模型未触发搜索)'}；参考来源={sources[:5]}；"
+            f"读取网页={'是' if read_pages else '否'} {pages[:5]}"
         )
         if not queries:
             logger.info("[vision_memory] Gemini 没有触发 Google 搜索（模型认为无需搜索）")
