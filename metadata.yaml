@@ -1,8 +1,8 @@
 name: astrbot_plugin_vision_memory
 display_name: 识图与角色记忆
-desc: 配合 LivingMemory：用更强的识图模型看图，并把联网核实后的角色信息写入长期记忆，避免重复检索。
+desc: 图片识别：先用 Google 以图搜图，再让 Gemini 读网页判断是谁，并把核实后的角色信息写入 LivingMemory 长期记忆。
 short_desc: 强识图模型 + 角色记忆写入 LivingMemory
-version: v0.6.2
+version: v0.7.0
 author: qualcone
 repo: https://github.com/qualcone/astrbot_plugin_vision_memory
 astrbot_version: ">=4.24.2"
