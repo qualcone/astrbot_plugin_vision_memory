@@ -59,10 +59,12 @@ CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier identific
 
 # Settings live in groups (menus in the AstrBot panel), in processing order.
 GROUP_OF = {
+    "gv_enable": "reverse",
     "gv_api_key": "reverse",
     "reverse_proxy": "reverse",
     "reader": "gemini",
     "reader_provider": "gemini",
+    "verify_enable": "verify",
     "verify_style": "verify",
     "verify_base_url": "verify",
     "verify_api_key": "verify",
@@ -631,6 +633,14 @@ class VisionMemory(Star):
             return bool((self._c("reader_provider") or "").strip())
         return bool((self._c("gemini_api_key") or "").strip())
 
+    def _gv_on(self) -> bool:
+        """Source A usable: switched on, key filled, and a step-2 model to read its pages."""
+        return bool(self._c("gv_enable", True)) and bool((self._c("gv_api_key") or "").strip()) and self._reader_ready()
+
+    def _verify_on(self) -> bool:
+        """Source B usable: switched on and the three required fields filled."""
+        return bool(self._c("verify_enable", True)) and self._verify_ready()
+
     def _verify_ready(self) -> bool:
         return all((self._c(k) or "").strip() for k in ("verify_base_url", "verify_api_key", "verify_model"))
 
@@ -644,7 +654,7 @@ class VisionMemory(Star):
                 return d
         except ValueError:
             pass
-        self._warn_once("verify_extra", "[vision_memory] 第四步“额外请求参数”不是有效的 JSON 对象，已忽略。")
+        self._warn_once("verify_extra", "[vision_memory] 联网大模型的“额外请求参数”不是有效的 JSON 对象，已忽略。")
         return {}
 
     def _warn_once(self, key: str, msg: str) -> None:
@@ -665,23 +675,28 @@ class VisionMemory(Star):
             has = lambda k: "已填" if (self._c(k) or "").strip() else "未填"
             reader = self._reader()
             who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}" if reader == "astrbot" else f"Gemini 密钥={has('gemini_api_key')}"
+            gv = "关" if not self._c("gv_enable", True) else ("开" if (self._c("gv_api_key") or "").strip() else "开但密钥未填")
+            vf = "关" if not self._c("verify_enable", True) else ("开" if self._verify_ready() else "开但未配置")
             logger.info(
-                "[vision_memory] 已加载：Google Vision 密钥=%s，第二步=%s，%s，第四步联网核实=%s，联网搜索资料=%s，LivingMemory 密钥=%s，行为指引=%s"
+                "[vision_memory] 已加载：Google 以图搜图=%s，联网大模型=%s，第二步=%s，%s，联网搜索资料=%s，LivingMemory 密钥=%s，行为指引=%s"
                 % (
-                    has("gv_api_key"), reader, who, "已配置" if self._verify_ready() else "未配置",
+                    gv, vf, reader, who,
                     ("开" if reader == "gemini" else "不支持") if self._c("profile_search", True) else "关",
                     has("lm_api_key"),
                     "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
                 )
             )
-            if not ((self._c("gv_api_key") or "").strip() and self._reader_ready()):
+            if not (self._gv_on() or self._verify_on()):
                 logger.warning(self._missing_msg())
         except Exception as e:
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
 
     def _missing_msg(self) -> str:
-        second = "第二步选择的 AstrBot 提供商" if self._reader() == "astrbot" else "“Gemini 密钥”"
-        return f"[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和{second}，否则图片会原样传给主模型。"
+        second = "第二步选择的 AstrBot 提供商" if self._reader() == "astrbot" else "第二步的 Gemini 密钥"
+        return (
+            "[vision_memory] 图片识别需要至少启用并配好一个第一步来源：A. Google 以图搜图（填 Google Vision 密钥，"
+            f"并配好{second}），或 B. 联网大模型（填接口地址、Key、模型）。否则图片会原样传给主模型。"
+        )
 
     @staticmethod
     def _tool_names(req) -> list:
@@ -736,7 +751,7 @@ class VisionMemory(Star):
         the main model can still look at them. Returns True if anything was added."""
         vkey = (self._c("gv_api_key") or "").strip()
         gkey = (self._c("gemini_api_key") or "").strip()
-        if not vkey or not self._reader_ready():
+        if not (self._gv_on() or self._verify_on()):
             self._warn_once("nokeys", self._missing_msg())
             return False
         user_text = req.prompt or ""
@@ -794,26 +809,39 @@ class VisionMemory(Star):
             self._dbg("同一张图一小时内已识别过，直接使用上次的结果")
             return hit[1], True, hit[2]
 
-        # step 1: pages on the web that contain this image (Google Cloud Vision)
+        # step 1: two independent, optional sources run at the same time:
+        #   A. Google Cloud Vision: web pages that contain this image
+        #   B. a vendor model with built-in web search: identifies the image on its own
+        gv_on, v_on = self._gv_on(), self._verify_on()
         vproxy = (self._c("reverse_proxy") or "").strip()
-        found, fail_text = None, "以图搜图没有找到相关网页，无法确认。"
-        try:
-            found = await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30)
-        except ReverseError as e:
-            logger.warning(f"[vision_memory] {e}")
-            fail_text = "以图搜图失败，无法确认。"
-        except asyncio.TimeoutError:
-            logger.warning("[vision_memory] Google Vision timed out")
-            fail_text = "以图搜图超时，无法确认。"
-        except Exception as e:
-            logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
-            fail_text = "以图搜图失败，无法确认。"
-        verify_ready = self._verify_ready()
-        if not found and not verify_ready:
-            self._dbg("Google Vision 没有找到相关网页")
-            return fail_text, False, ""
+
+        async def source_a():
+            if not gv_on:
+                return None, ""
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30), ""
+            except ReverseError as e:
+                logger.warning(f"[vision_memory] {e}")
+                return None, "以图搜图失败，无法确认。"
+            except asyncio.TimeoutError:
+                logger.warning("[vision_memory] Google Vision timed out")
+                return None, "以图搜图超时，无法确认。"
+            except Exception as e:
+                logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
+                return None, "以图搜图失败，无法确认。"
+
+        async def source_b():
+            if not v_on:
+                return None
+            text, err = await self._verify_raw(image, user_text, "", "", "", "")
+            return None if err else self._parse_answer(text)
+
+        (found, google_fail), v = await asyncio.gather(source_a(), source_b())
+        if not found and not v:
+            self._dbg("两个来源都没有结果")
+            return (google_fail or ("以图搜图没有找到相关网页，无法确认。" if gv_on else "联网大模型没有给出可用的结果，无法确认。")), False, ""
         summary = _format_found(found) if found else ""
-        self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果，直接交给第四步的联网模型")
+        self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果（或未启用），只用联网大模型的结果")
 
         raw = ""  # the model's own text, passed through when it ignores the answer format
         obj = src = setting = evidence = candidates = ""
@@ -825,7 +853,7 @@ class VisionMemory(Star):
             except Exception as e:
                 logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
                 conclusion = ""
-            if not conclusion and not verify_ready:
+            if not conclusion and not v:
                 return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
             if conclusion:
                 obj = _field(conclusion, "对象") or _field(conclusion, "角色")
@@ -855,22 +883,20 @@ class VisionMemory(Star):
                 else:
                     raw = conclusion
 
-        # step 4 (optional): another model with built-in web search verifies / fills in
-        if verify_ready:
-            v = await self._verify(image, user_text, obj, src, setting, summary)
-            if v:
-                structured, raw = True, ""
-                if _known(v["obj"]) and not _known(obj):
-                    obj = v["obj"]
-                elif _known(v["obj"]) and _known(obj) and not _same_name(obj, v["obj"]):
-                    other = f"二次核实认为 {v['obj']}"
-                    candidates = (candidates + "；" if _known(candidates) else "") + other
-                if _known(v["src"]) and not _known(src):
-                    src = v["src"]
-                if _has_setting(v["setting"]) and not _has_setting(setting):
-                    setting = v["setting"]
-                if v["evidence"]:
-                    evidence = (evidence + "；" if evidence else "") + "二次核实：" + v["evidence"]
+        # merge source B's answer with what steps 2-3 found
+        if v:
+            structured, raw = True, ""
+            if _known(v["obj"]) and not _known(obj):
+                obj = v["obj"]
+            elif _known(v["obj"]) and _known(obj) and not _same_name(obj, v["obj"]):
+                other = f"联网大模型认为 {v['obj']}"
+                candidates = (candidates + "；" if _known(candidates) else "") + other
+            if _known(v["src"]) and not _known(src):
+                src = v["src"]
+            if _has_setting(v["setting"]) and not _has_setting(setting):
+                setting = v["setting"]
+            if v["evidence"]:
+                evidence = (evidence + "；" if evidence else "") + "联网大模型：" + v["evidence"]
 
         if structured:
             identified = _known(obj) or _known(src)
@@ -926,24 +952,26 @@ class VisionMemory(Star):
             return _clip(text, 600) if text else ""
         return ""
 
-    async def _verify(self, image, user_text, obj, src, setting, summary):
-        """Step 4: ask a vendor model that has web search built in to verify / fill in
-        the identification. Returns {"obj","src","setting","evidence"} or None."""
+    async def _verify_raw(self, image, user_text, obj, src, setting, summary):
+        """Call the step-4 model. Returns (its answer text, error message); never raises."""
         base = (self._c("verify_base_url") or "").strip()
         if urlparse(base).scheme not in ("http", "https"):
-            self._warn_once("verify_url", "[vision_memory] 第四步“接口地址”必须以 http:// 或 https:// 开头。")
-            return None
+            self._warn_once("verify_url", "[vision_memory] 联网大模型的“接口地址”必须以 http:// 或 https:// 开头。")
+            return "", "接口地址必须以 http:// 或 https:// 开头"
         style = str(self._c("verify_style", "chat") or "chat").strip()
         style = style if style in VERIFY_STYLES else "chat"
         system = (self._c("verify_prompt") or "").strip() or DEFAULT_VERIFY_PROMPT
-        known = (
-            f"已知线索：\n对象：{_clip(obj or '未确定', 80)}\n出处：{_clip(src or '未知', 80)}\n"
-            f"设定：{_clip(setting, 150) if _has_setting(setting) else '未读到'}\n"
-        )
+        if obj or src or summary or _has_setting(setting):
+            known = (
+                f"已知线索：\n对象：{_clip(obj or '未确定', 80)}\n出处：{_clip(src or '未知', 80)}\n"
+                f"设定：{_clip(setting, 150) if _has_setting(setting) else '未读到'}\n"
+                + (f"以图搜图找到的信息：\n{summary}\n" if summary else "")
+            )
+        else:
+            known = "没有已知线索。\n"
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
             + known
-            + (f"以图搜图找到的信息：\n{summary}\n" if summary else "以图搜图没有找到相关网页。\n")
             + "\n请联网搜索核实图中对象是谁。"
         )
         try:
@@ -955,15 +983,19 @@ class VisionMemory(Star):
                 timeout=VERIFY_TIMEOUT + 5,
             )
         except asyncio.TimeoutError:
-            logger.warning("[vision_memory] 第四步联网模型超时")
-            return None
+            logger.warning("[vision_memory] 联网大模型超时")
+            return "", "超时"
         except ModelApiError as e:
-            logger.warning(f"[vision_memory] 第四步联网模型调用失败：{e}")
-            return None
+            logger.warning(f"[vision_memory] 联网大模型调用失败：{e}")
+            return "", str(e)
         except Exception as e:
-            logger.warning(f"[vision_memory] 第四步联网模型调用失败：{type(e).__name__}")
-            return None
-        self._dbg(f"第四步联网模型（{style}）输出: {_clip(text, 600)}")
+            logger.warning(f"[vision_memory] 联网大模型调用失败：{type(e).__name__}")
+            return "", type(e).__name__
+        self._dbg(f"联网大模型（{style}）输出: {_clip(text, 600)}")
+        return text, ""
+
+    @staticmethod
+    def _parse_answer(text):
         v = {
             "obj": _field(text, "对象") or _field(text, "角色"),
             "src": _field(text, "出处") or _field(text, "作品"),
@@ -971,6 +1003,62 @@ class VisionMemory(Star):
             "evidence": _field(text, "依据"),
         }
         return v if (v["obj"] or v["src"]) else None
+
+    # ---- admin command: try the vendor model (source B) on its own ----
+    async def _images_of(self, event) -> list:
+        """Images in the command message, or in the message it replies to."""
+        try:
+            import astrbot.api.message_components as Comp
+        except Exception:
+            return []
+        chains = [event.get_messages()]
+        for comp in list(event.get_messages()):
+            if isinstance(comp, Comp.Reply):
+                chains.append(comp.chain or [])
+        urls = []
+        for chain in chains:
+            for comp in chain:
+                if isinstance(comp, Comp.Image):
+                    try:
+                        urls.append(await comp.convert_to_file_path())
+                    except Exception:
+                        u = getattr(comp, "url", "") or getattr(comp, "file", "") or getattr(comp, "path", "")
+                        if u:
+                            urls.append(u)
+        return urls
+
+    @filter.command("vmtest")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def vmtest(self, event: AstrMessageEvent):
+        """（管理员）测试联网大模型（第一步的来源 B）：把消息里的图片（或所回复消息里的图片）只发给它，直接显示它的原始回答或报错。"""
+        if not self._verify_ready():
+            yield event.plain_result("联网大模型还没配置完整：需要同时填写“接口地址、API Key、模型”。")
+            return
+        urls = await self._images_of(event)
+        if not urls:
+            yield event.plain_result("请在发送 /vmtest 的同一条消息里带上一张图片，或者回复一条带图片的消息再发 /vmtest。")
+            return
+        try:
+            image = await asyncio.wait_for(asyncio.to_thread(_read_image, urls[0], IMAGE_MAX_BYTES, 20), timeout=25)
+        except Exception as e:
+            yield event.plain_result(f"图片读取失败：{e}")
+            return
+        t0 = time.monotonic()
+        text, err = await self._verify_raw(image, "", "", "", "", "")
+        secs = time.monotonic() - t0
+        head = f"联网大模型测试：模型 {(self._c('verify_model') or '').strip()}（{self._c('verify_style', 'chat')}），耗时 {secs:.1f} 秒"
+        if err:
+            yield event.plain_result(head + f"\n调用失败：{err}\n（详细原因也在 AstrBot 日志里，搜 vision_memory）")
+            return
+        parsed = self._parse_answer(text)
+        body = f"{head}\n—— 模型原始回答 ——\n{_clip(text, 1200) or '（空）'}"
+        body += (
+            "\n—— 插件能读到的字段 ——\n"
+            + "\n".join(f"{k}：{v or '（无）'}" for k, v in (("对象", parsed["obj"]), ("出处", parsed["src"]), ("设定", parsed["setting"]), ("依据", parsed["evidence"])))
+            if parsed
+            else "\n—— 插件没有读到“对象 / 出处”，回答没有按四行格式，会被原样忽略 ——"
+        )
+        yield event.plain_result(body)
 
     async def _read(self, image, user_text, found, summary, gkey) -> str:
         """Step 2: the chosen model reads the pages and says which work / character."""
