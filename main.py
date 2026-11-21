@@ -17,13 +17,14 @@ degrades to a placeholder text and a log line.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
@@ -39,16 +40,17 @@ WRITE_TIMEOUT = 85  # seconds; LivingMemory's own request limit is 90s
 PERSONA_NONE = "[%None]"
 
 DEFAULT_SEARCH_PROMPT = (
-    "你是识图助手，任务是准确识别图片。宁可写“无法确认”，也不要编造。\n"
-    "1. 先仔细观察图片：人物外貌特征、画风、画面中的所有文字（标题、字幕、水印、Logo、界面文字）。\n"
-    "2. 如果图中有动漫、游戏角色、作品、表情包、梗图，且你不能百分之百确定其名称或出处，"
-    "必须先调用 recall_long_term_memory（如果可用）查长期记忆；查不到或内容不清晰，就调用联网搜索工具核实，"
-    "用外貌特征和图中文字作关键词，必要时换关键词多搜几次。\n"
-    "3. 只采信搜索结果中能与图片特征对上的信息，对不上就继续搜，仍然对不上就写“无法确认”。\n"
-    "4. 最终输出两部分，不要输出搜索过程：\n"
-    "识别结论：角色名 / 作品名 / 依据（来自记忆，或搜索到的哪条信息）；无法确认就写“识别结论：无法确认”。\n"
-    "画面描述：客观描述外貌、画风和画面文字。"
+    "你是识图助手。你对角色的第一印象经常是错的，所以必须联网搜索，以搜索结果为准。\n"
+    "先看图提取外貌特征和画面文字，用它们联网搜索（可先用 recall_long_term_memory 查记忆）；"
+    "结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
+    "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
 )
+DEFAULT_GEMINI_PROMPT = (
+    "你是识图助手。你对角色的第一印象经常是错的，所以必须用 Google 搜索核实，以搜索结果为准。\n"
+    "先看图提取外貌特征和画面文字，再搜索；结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
+    "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
+)
+_FORCE_SEARCH = "你刚才没有调用联网搜索工具。请先用图中特征联网搜索，再按要求输出。"
 
 _CAPTION_HEADER = (
     "[以下是识图模型对用户所发图片的客观描述，仅供参考；"
@@ -114,6 +116,37 @@ def _oversize_reason(url: str, max_mb: int) -> str:
     return f"超过 {max_mb}MB 上限" if size > limit else ""
 
 
+# Settings live in groups (secondary menus in the AstrBot panel). Flat keys from
+# older versions are still read as a fallback and are migrated on startup.
+GROUP_OF = {
+    "enable_caption": "basic",
+    "caption_provider": "basic",
+    "search_mode": "basic",
+    "enable_guidance": "basic",
+    "gemini_api_key": "gemini",
+    "gemini_model": "gemini",
+    "gemini_base_url": "gemini",
+    "gemini_proxy": "gemini",
+    "lm_api_url": "memory",
+    "lm_api_key": "memory",
+    "memory_scope": "memory",
+    "caption_prompt": "caption_advanced",
+    "caption_search_prompt": "caption_advanced",
+    "caption_search_tools": "caption_advanced",
+    "caption_search_steps": "caption_advanced",
+    "caption_search_timeout": "caption_advanced",
+    "replace_images": "caption_advanced",
+    "max_images": "caption_advanced",
+    "caption_timeout": "caption_advanced",
+    "max_caption_chars": "caption_advanced",
+    "max_image_mb": "caption_advanced",
+    "guidance_mode": "guidance_advanced",
+    "guidance_keywords": "guidance_advanced",
+    "guidance_prompt": "guidance_advanced",
+    "log_caption": "debug",
+}
+SEARCH_MODES = ("tools", "gemini_direct", "off")
+
 RECALL_TOOL = "recall_long_term_memory"
 _SEARCH_EXCLUDE = ("memory", "knowledge", "kb_")
 
@@ -136,6 +169,119 @@ def _is_search_tool(name: str) -> bool:
     return "search" in n or "tavily" in n or "extract_web" in n
 
 
+GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
+
+
+class GeminiError(Exception):
+    pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+def _sniff_mime(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _read_image(url: str, max_bytes: int, timeout: int) -> bytes:
+    """Blocking. Load the image bytes from base64:// / http(s):// / file path.
+    Raises ValueError with a short reason. No credentials are ever sent here."""
+    if url.startswith("base64://"):
+        try:
+            data = base64.b64decode(url[len("base64://"):])
+        except Exception:
+            raise ValueError("base64 图片无法解码")
+    elif url.startswith(("http://", "https://")):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(max_bytes + 1)
+    else:
+        path = unquote(urlparse(url).path) if url.startswith("file://") else url
+        if os.name == "nt" and path[:1] == "/" and path[2:3] == ":":
+            path = path[1:]
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1)
+    if not data:
+        raise ValueError("图片内容为空")
+    if len(data) > max_bytes:
+        raise ValueError("图片超过大小上限")
+    return data
+
+
+def _gemini_request(base, model, key, proxy, system, ask, image, timeout):
+    """Blocking call to the Gemini REST API with Google Search grounding.
+    The key goes only into the x-goog-api-key header of this one request and
+    redirects are not followed. Returns (text, search_queries, source_titles)."""
+    model = model.strip()
+    if model.startswith("models/"):
+        model = model[len("models/"):]
+    url = f"{base}/v1beta/models/{quote(model, safe='.-_')}:generateContent"
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": ask},
+                    {"inlineData": {"mimeType": _sniff_mime(image), "data": base64.b64encode(image).decode("ascii")}},
+                ],
+            }
+        ],
+        "tools": [{"google_search": {}}],
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    handlers = [_NoRedirect()]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+    )
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8") or "{}")
+            msg = (err.get("error") or {}).get("message") or ""
+        except Exception:
+            msg = ""
+        raise GeminiError(f"HTTP {e.code} {msg[:200]}".strip())
+    except ValueError:
+        raise GeminiError("返回内容不是有效的 JSON")
+    cands = data.get("candidates") or [] if isinstance(data, dict) else []
+    if not cands:
+        reason = ((data or {}).get("promptFeedback") or {}).get("blockReason")
+        raise GeminiError("没有返回结果" + (f"（被拦截：{reason}）" if reason else ""))
+    cand = cands[0] if isinstance(cands[0], dict) else {}
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str)
+    ).strip()
+    meta = cand.get("groundingMetadata") or {}
+    queries = [q for q in (meta.get("webSearchQueries") or []) if isinstance(q, str)]
+    sources = [
+        str((c.get("web") or {}).get("title") or (c.get("web") or {}).get("uri") or "")
+        for c in (meta.get("groundingChunks") or [])
+        if isinstance(c, dict)
+    ]
+    return text, queries, [x for x in sources if x]
+
+
 def _clip(text, limit: int) -> str:
     text = "" if text is None else str(text)
     return text if len(text) <= limit else text[:limit] + f"…(共{len(text)}字，已截断)"
@@ -154,10 +300,50 @@ class VisionMemory(Star):
         self.config = config
         self._warned_no_provider = False
         self._write_lock = asyncio.Lock()
+        self._warned_gemini_key = False
+        self._migrate_legacy()
+        self._get_broken = False
+
+    # ---- config access ----
+    def _c(self, key, default=None):
+        """Read a setting from its group; fall back to a flat key (older versions)."""
+        group = GROUP_OF.get(key)
+        g = self.config.get(group) if group else None
+        if isinstance(g, dict) and key in g:
+            return g[key]
+        return self.config.get(key, default)
+
+    def _migrate_legacy(self) -> None:
+        """Move flat settings saved by v0.4.3 and earlier into their groups."""
+        try:
+            moved = False
+            for key, group in GROUP_OF.items():
+                g = self.config.get(group)
+                if key in self.config and isinstance(g, dict):
+                    g[key] = self.config[key]
+                    del self.config[key]
+                    moved = True
+            g = self.config.get("basic")
+            if "caption_use_search" in self.config and isinstance(g, dict):
+                if self.config["caption_use_search"] is False:
+                    g["search_mode"] = "off"
+                del self.config["caption_use_search"]
+                moved = True
+            if moved and hasattr(self.config, "save_config"):
+                self.config.save_config()
+                logger.info("[vision_memory] 已把旧版配置迁移到分组设置中。")
+        except Exception as e:
+            logger.warning(f"[vision_memory] settings migration failed: {type(e).__name__}")
+
+    def _search_mode(self) -> str:
+        if self.config.get("caption_use_search") is False:  # unmigrated legacy key
+            return "off"
+        mode = str(self._c("search_mode", "tools") or "tools").strip()
+        return mode if mode in SEARCH_MODES else "tools"
 
     # ---- debug helpers (all output gated by the "log_caption" switch) ----
     def _debug_on(self) -> bool:
-        return bool(self.config.get("log_caption", False))
+        return bool(self._c("log_caption", False))
 
     def _dbg(self, msg: str) -> None:
         if self._debug_on():
@@ -197,7 +383,7 @@ class VisionMemory(Star):
         except Exception as e:
             logger.warning(f"[vision_memory] guidance failed: {type(e).__name__}: {e}")
         try:
-            if self.config.get("enable_caption", True) and req.image_urls:
+            if self._c("enable_caption", True) and req.image_urls:
                 await self._caption(req, event)
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] caption stage crashed: {type(e).__name__}: {e}")
@@ -220,7 +406,7 @@ class VisionMemory(Star):
                 f"随消息的图片数: {len(req.image_urls or [])}\n"
                 f"历史消息条数: {len(ctxs)}\n"
                 f"系统提示词总长: {len(sp_text)}字；是否含行为指引: "
-                f"{bool((self.config.get('guidance_prompt') or '').strip() and (self.config.get('guidance_prompt') or '').strip() in sp_text)}\n"
+                f"{bool((self._c('guidance_prompt') or '').strip() and (self._c('guidance_prompt') or '').strip() in sp_text)}\n"
                 f"系统提示词末尾 800 字: {_clip(sp_text[-800:], 900)}\n"
                 f"可用工具({len(tools)}): {tools}\n"
                 f"其中 recall_long_term_memory: {'recall_long_term_memory' in tools}；"
@@ -236,12 +422,12 @@ class VisionMemory(Star):
         message carries an image, the text contains a keyword, or an image was
         described in the last few turns (so a follow-up like "他是谁" still works).
         """
-        if (self.config.get("guidance_mode") or "auto").strip() == "always":
+        if (self._c("guidance_mode") or "auto").strip() == "always":
             return True
         if req.image_urls:
             return True
         text = (req.prompt or "").lower()
-        if any(k in text for k in _keywords(self.config.get("guidance_keywords", DEFAULT_KEYWORDS))):
+        if any(k in text for k in _keywords(self._c("guidance_keywords", DEFAULT_KEYWORDS))):
             return True
         for m in (getattr(req, "contexts", None) or [])[-CONTEXT_LOOKBACK:]:
             if isinstance(m, dict) and _CAPTION_HEADER in _text_of(m.get("content")):
@@ -249,12 +435,12 @@ class VisionMemory(Star):
         return False
 
     def _apply_guidance(self, req: ProviderRequest) -> None:
-        if not self.config.get("enable_guidance", True):
+        if not self._c("enable_guidance", True):
             return
         if not self._should_guide(req):
             logger.info("[vision_memory] guidance skipped (no image, trigger word or recent image context)")
             return
-        guidance = (self.config.get("guidance_prompt") or "").strip()
+        guidance = (self._c("guidance_prompt") or "").strip()
         if guidance and guidance not in (req.system_prompt or ""):
             req.system_prompt = ((req.system_prompt or "") + "\n\n" + guidance).lstrip()
             logger.info("[vision_memory] guidance appended to system prompt")
@@ -264,7 +450,7 @@ class VisionMemory(Star):
         (taken from the request AstrBot already assembled) plus LivingMemory's
         recall tool. Returns (ToolSet | None, [names])."""
         tools = getattr(getattr(req, "func_tool", None), "tools", None) or []
-        explicit = _names(self.config.get("caption_search_tools", []))
+        explicit = _names(self._c("caption_search_tools", []))
         chosen = []
         for t in tools:
             name = (getattr(t, "name", "") or "").lower()
@@ -285,41 +471,125 @@ class VisionMemory(Star):
             return None, []
         return ts, [t.name for t in chosen]
 
-    async def _caption_agent(self, event, pid, ts, user_text, prompt, url, timeout, steps, max_chars) -> str:
-        """Let the vision model search (memory first, then the web) before it
-        describes the image. Returns text, or '' on any failure."""
-        system = (self.config.get("caption_search_prompt") or "").strip() or DEFAULT_SEARCH_PROMPT
-        ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
+    def _tool_hooks(self, calls):
+        """Agent hooks that record which tools the vision model really called."""
         try:
-            resp = await asyncio.wait_for(
-                self.context.tool_loop_agent(
-                    event=event,
-                    chat_provider_id=pid,
-                    prompt=ask,
-                    image_urls=[url],
-                    tools=ts,
-                    system_prompt=system,
-                    max_steps=steps,
-                    tool_call_timeout=60,
-                ),
-                timeout=timeout,
-            )
-            text = (getattr(resp, "completion_text", "") or "").strip()
+            from astrbot.core.agent.hooks import BaseAgentRunHooks
+        except Exception:
+            return None
+        dbg = self._dbg
+
+        class _Hooks(BaseAgentRunHooks):
+            async def on_tool_start(self, run_context, tool, tool_args):
+                name = getattr(tool, "name", "?")
+                calls.append(name)
+                try:
+                    shown = json.dumps(tool_args, ensure_ascii=False)
+                except Exception:
+                    shown = str(tool_args)
+                dbg(f"识图模型调用工具 {name}，参数: {_clip(shown, 300)}")
+
+        return _Hooks()
+
+    async def _agent_run(self, event, pid, ts, ask, url, system, steps, timeout, hooks):
+        kwargs = {"agent_hooks": hooks} if hooks is not None else {}
+        resp = await asyncio.wait_for(
+            self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=pid,
+                prompt=ask,
+                image_urls=[url],
+                tools=ts,
+                system_prompt=system,
+                max_steps=steps,
+                tool_call_timeout=60,
+                **kwargs,
+            ),
+            timeout=timeout,
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _caption_agent(self, event, pid, ts, user_text, prompt, url, timeout, steps, max_chars) -> str:
+        """Let the vision model search (memory, then the web) before it
+        describes the image. If it answered without calling any web-search tool,
+        run it once more with an explicit demand to search. Returns text, or ''
+        on any failure."""
+        system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_SEARCH_PROMPT
+        ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
+        calls = []
+        hooks = self._tool_hooks(calls)
+        started = time.monotonic()
+        text = ""
+        try:
+            text = await self._agent_run(event, pid, ts, ask, url, system, steps, timeout, hooks)
+            searched = any(n != RECALL_TOOL for n in calls)
+            left = timeout - (time.monotonic() - started)
+            if hooks is not None and not searched and left >= 20:
+                logger.info("[vision_memory] vision model answered without web search, asking it to search")
+                self._dbg(f"首轮未调用搜索工具（调用过: {calls}），追加要求后重跑；首轮输出: {_clip(text, 300)}")
+                calls.clear()
+                again = await self._agent_run(
+                    event, pid, ts, ask + "\n\n" + _FORCE_SEARCH, url, system, steps, left, hooks
+                )
+                text = again or text
         except asyncio.TimeoutError:
             logger.warning(f"[vision_memory] search-assisted caption timed out after {timeout}s")
-            return ""
         except Exception as e:
             logger.warning(f"[vision_memory] search-assisted caption failed: {type(e).__name__}: {e}")
-            return ""
         if len(text) > max_chars:
             text = text[:max_chars].rstrip() + "…（已截断）"
         return text
 
-    async def _caption_one(self, pid: str, prompt: str, url: str, timeout: int, max_chars: int) -> str:
+    async def _caption_gemini(self, url, user_text, timeout, max_chars, max_mb) -> str:
+        """Identify the image through Gemini directly (own key, Google Search
+        grounding). Does not use AstrBot's providers. Returns text or ''."""
+        key = (self._c("gemini_api_key") or "").strip()
+        base = (self._c("gemini_base_url") or GEMINI_DEFAULT_BASE).strip().rstrip("/")
+        model = (self._c("gemini_model") or GEMINI_DEFAULT_MODEL).strip()
+        proxy = (self._c("gemini_proxy") or "").strip()
+        if urlparse(base).scheme not in ("http", "https"):
+            logger.warning("[vision_memory] Gemini 接口地址必须以 http:// 或 https:// 开头。")
+            return ""
+        system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_GEMINI_PROMPT
+        ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
+        try:
+            image = await asyncio.wait_for(
+                asyncio.to_thread(_read_image, url, max_mb * 1024 * 1024, 20), timeout=25
+            )
+            text, queries, sources = await asyncio.wait_for(
+                asyncio.to_thread(_gemini_request, base, model, key, proxy, system, ask, image, timeout),
+                timeout=timeout + 5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[vision_memory] Gemini direct call timed out after {timeout}s")
+            return ""
+        except GeminiError as e:
+            logger.warning(f"[vision_memory] Gemini direct call failed: {e}")
+            return ""
+        except ValueError as e:
+            logger.warning(f"[vision_memory] image could not be loaded for Gemini: {e}")
+            return ""
+        except Exception as e:
+            logger.warning(f"[vision_memory] Gemini direct call failed: {type(e).__name__}")
+            return ""
+        self._dbg(
+            f"Gemini 直连: 模型={model} 地址={base}{' 代理=已设置' if proxy else ''}；"
+            f"Google 实际搜索词={queries or '(无，模型未触发搜索)'}；参考来源={sources[:5]}"
+        )
+        if not queries:
+            logger.info("[vision_memory] Gemini 没有触发 Google 搜索（模型认为无需搜索）")
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "…（已截断）"
+        return text
+
+    async def _caption_one(self, pid: str, prompt: str, url: str, timeout: int, max_chars: int, system=None) -> str:
         """Caption one image. Returns text, or '' on any failure."""
         try:
             resp = await asyncio.wait_for(
-                self.context.llm_generate(chat_provider_id=pid, prompt=prompt, image_urls=[url]),
+                self.context.llm_generate(
+                    chat_provider_id=pid, prompt=prompt, image_urls=[url],
+                    **({"system_prompt": system} if system else {}),
+                ),
                 timeout=timeout,
             )
             text = (getattr(resp, "completion_text", "") or "").strip()
@@ -334,26 +604,34 @@ class VisionMemory(Star):
         return text
 
     async def _caption(self, req: ProviderRequest, event=None) -> None:
-        pid = (self.config.get("caption_provider") or "").strip()
-        if not pid:
+        pid = (self._c("caption_provider") or "").strip()
+        mode = self._search_mode()
+        direct = mode == "gemini_direct"
+        if direct:
+            if not (self._c("gemini_api_key") or "").strip():
+                if not self._warned_gemini_key:
+                    logger.warning("[vision_memory] 识图方式为 Gemini 直连，但未填写 Gemini API Key，图片将原样传给主模型。")
+                    self._warned_gemini_key = True
+                return
+        elif not pid:
             if not self._warned_no_provider:
                 logger.warning("[vision_memory] 未选择识图模型，图片将原样传给主模型。")
                 self._warned_no_provider = True
             return
 
-        prompt = self.config.get("caption_prompt") or "请用中文详细描述这张图片。"
-        max_images = _as_int(self.config.get("max_images", 4), 4, 1, 20)
-        timeout = _as_int(self.config.get("caption_timeout", 60), 60, 5, 300)
-        max_chars = _as_int(self.config.get("max_caption_chars", 800), 800, 100, 4000)
-        max_mb = _as_int(self.config.get("max_image_mb", 10), 10, 1, 50)
+        prompt = self._c("caption_prompt") or "请用中文详细描述这张图片。"
+        max_images = _as_int(self._c("max_images", 4), 4, 1, 20)
+        timeout = _as_int(self._c("caption_timeout", 60), 60, 5, 300)
+        max_chars = _as_int(self._c("max_caption_chars", 800), 800, 100, 4000)
+        max_mb = _as_int(self._c("max_image_mb", 10), 10, 1, 50)
 
         urls = list(req.image_urls)
         user_text = req.prompt or ""
 
         search_ts, search_names = None, []
-        search_timeout = _as_int(self.config.get("caption_search_timeout", 150), 150, 30, 600)
-        search_steps = _as_int(self.config.get("caption_search_steps", 6), 6, 1, 15)
-        if self.config.get("caption_use_search", True) and event is not None:
+        search_timeout = _as_int(self._c("caption_search_timeout", 150), 150, 30, 600)
+        search_steps = _as_int(self._c("caption_search_steps", 6), 6, 1, 15)
+        if mode == "tools" and event is not None:
             search_ts, search_names = self._search_toolset(req)
             if search_ts is None and not getattr(self, "_warned_no_search", False):
                 logger.warning(
@@ -362,11 +640,11 @@ class VisionMemory(Star):
                 )
                 self._warned_no_search = True
         self._dbg(
-            f"识图模式: {'联网核实后再描述' if search_ts is not None else '直接描述（不联网）'}；"
+            f"识图模式: {'Gemini 直连（Google 搜索）' if direct else ('联网核实后再描述' if search_ts is not None else '直接描述（不联网）')}；"
             f"识图模型可用工具: {search_names}；主请求中全部工具: {self._tool_names(req)}"
         )
         self._dbg(
-            f"识图开始: 识图模型={self._provider_label(pid)}；图片{len(urls)}张（上限{max_images}）；"
+            f"识图开始: 识图模型={'Gemini 直连' if direct else self._provider_label(pid)}；图片{len(urls)}张（上限{max_images}）；"
             f"超时{timeout}s；单张描述上限{max_chars}字\n识图提示词: {_clip(prompt, 1200)}\n"
             f"原始用户消息: {_clip(req.prompt, 500)}"
         )
@@ -382,13 +660,17 @@ class VisionMemory(Star):
                 continue
             t0 = time.monotonic()
             text = ""
-            if search_ts is not None:
+            if direct:
+                text = await self._caption_gemini(url, user_text, search_timeout, max_chars, max_mb)
+                if not text:
+                    logger.warning("[vision_memory] Gemini direct caption empty, falling back to the AstrBot provider")
+            elif search_ts is not None:
                 text = await self._caption_agent(
                     event, pid, search_ts, user_text, prompt, url, search_timeout, search_steps, max_chars
                 )
                 if not text:
                     logger.warning("[vision_memory] search-assisted caption empty, falling back to plain caption")
-            if not text:
+            if not text and pid:
                 text = await self._caption_one(pid, prompt, url, timeout, max_chars)
             self._dbg(
                 f"图片{i} [{_describe_image(url)}] 耗时 {time.monotonic() - t0:.1f}s，"
@@ -399,7 +681,7 @@ class VisionMemory(Star):
         ok = sum(1 for p in parts if "描述]" in p and "(识别失败)" not in p)
         logger.info(f"[vision_memory] captioned {ok}/{len(urls)} image(s)")
 
-        if self.config.get("replace_images", True):
+        if self._c("replace_images", True):
             req.image_urls = []
         block = _CAPTION_HEADER + "\n" + "\n".join(parts)
         base = (req.prompt or "").rstrip()
@@ -537,12 +819,21 @@ class VisionMemory(Star):
             mid = item.get("memory_id") if isinstance(item, dict) else None
             if not isinstance(mid, int) or mid not in owned:
                 continue
-            try:
-                st, d = await self._call("GET", base, f"{MEMORIES_PATH}/{mid}", key)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                continue
+            if self._get_broken:
+                st, d = 500, {}  # known-broken on this LivingMemory: don't trigger its error log again
+            else:
+                try:
+                    st, d = await self._call("GET", base, f"{MEMORIES_PATH}/{mid}", key)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
+                if st >= 500:
+                    self._get_broken = True
+                    logger.info(
+                        "[vision_memory] LivingMemory 读取单条记录接口返回 5xx（其自身缺陷），"
+                        "此后改用登记表 + 内容模板校验归属，不再调用该接口。"
+                    )
             mem = d.get("memory") if st == 200 and isinstance(d, dict) else None
             if not isinstance(mem, dict):
                 if st in (404, 403, 401):
@@ -564,8 +855,8 @@ class VisionMemory(Star):
     async def _lm_write(self, event, memory, topics, key_facts, name, work):
         """Create or update the character memory. Returns a message for the
         model. Never raises."""
-        base = (self.config.get("lm_api_url") or "").strip().rstrip("/")
-        key = (self.config.get("lm_api_key") or "").strip()
+        base = (self._c("lm_api_url") or "").strip().rstrip("/")
+        key = (self._c("lm_api_key") or "").strip()
         if not base or not key:
             logger.warning("[vision_memory] not written: LivingMemory API url or token is empty in plugin config")
             return "未配置 LivingMemory 外部 API 地址或 Key，未写入记忆。"
@@ -574,7 +865,7 @@ class VisionMemory(Star):
         if not key.startswith("lm_"):
             return "LivingMemory 外部 API Key 格式不正确（应以 lm_ 开头）。"
 
-        scope_mode = (self.config.get("memory_scope") or "session").strip()
+        scope_mode = (self._c("memory_scope") or "session").strip()
         persona = await self._persona_id(event)
         scope = event.unified_msg_origin if scope_mode == "session" else None
 
