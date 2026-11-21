@@ -114,7 +114,7 @@
         "description": "接口地址",
         "type": "string",
         "default": "",
-        "hint": "例如 https://api.openai.com/v1 或厂商给出的兼容地址。不要带 /chat/completions。Key 会发往此地址，请只填可信地址。"
+        "hint": "例如通义千问 https://dashscope.aliyuncs.com/compatible-mode/v1（或百炼推荐的工作空间域名）、OpenAI https://api.openai.com/v1。不要带 /chat/completions。Key 会发往此地址，请只填可信地址。"
       },
       "verify_api_key": {
         "description": "API Key",
@@ -133,7 +133,7 @@
         "description": "额外请求参数（JSON）",
         "type": "text",
         "default": "",
-        "hint": "用来打开该厂商的联网搜索，原样合并进请求体。例如通义千问：{\"enable_search\": true}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}；OpenAI/豆包 Responses：{\"tools\": [{\"type\": \"web_search\"}]}。需要流式输出的厂商加 \"stream\": true。具体写法请以厂商文档为准。"
+        "hint": "用来打开该厂商的联网搜索，原样合并进请求体。例如通义千问（多模态模型必须流式）：{\"enable_search\": true, \"search_options\": {\"forced_search\": true}, \"stream\": true}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}；OpenAI/豆包 Responses：{\"tools\": [{\"type\": \"web_search\"}]}。具体写法请以厂商文档为准。"
       },
       "verify_prompt": {
         "description": "核实提示词",

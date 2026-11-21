@@ -89,9 +89,18 @@ Google 的网页匹配对一部分二次元角色搜不到。第 4 步再调一�
 
 | 厂商 | 接口格式 | 额外请求参数示例 |
 | --- | --- | --- |
-| 通义千问（百炼） | `chat` | `{"enable_search": true}`；文档提到多模态模型开启联网搜索时需流式输出，可加 `"stream": true`；也可试 `responses` 格式 |
+| 通义千问（百炼） | `chat` | `{"enable_search": true, "search_options": {"forced_search": true}, "stream": true}`，详见下文 |
 | 智谱 GLM | `chat` | `{"tools": [{"type": "web_search", "web_search": {"enable": true}}]}` |
 | OpenAI / 豆包（方舟） | `responses` | `{"tools": [{"type": "web_search"}]}` |
+
+**通义千问（百炼）的配置要点**（来自官方联网搜索文档，部分细节我无法确认，请以控制台为准）：
+
+- 接口地址：`https://dashscope.aliyuncs.com/compatible-mode/v1`；官方推荐并说明后续新特性只在工作空间域名上提供，形如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。国际站（新加坡）的域名不同，Key 和模型列表也不通用。
+- 模型：要选**支持图片输入的多模态模型**，并且在支持联网搜索的列表里。官方多模态联网搜索示例用的是 `qwen3.5-plus`；Qwen3.5 / 3.6 / 3.7 / 3.8 的 Plus、Flash 系列文档里也列了。`qwen-vl-*`、`qwen3-vl-*` 文档没有提到，按不支持处理。
+- **必须加 `"stream": true`**：官方说明多模态模型开启联网搜索时，非流式会报 `Non-streaming mode does not support Web Search`。插件会自动读取流式结果。
+- `forced_search: true` 表示每次都强制搜索（默认由模型决定要不要搜），识图核实场景建议开启。`search_strategy` 可选 `turbo`、`max`、`agent`，多模态接口下部分模型（如 qwen4-max、qwen3.8 系列）不支持 `agent`。
+- 计费：联网搜索按次收费（每 1000 次约 3～4 元，具体看策略和地域），模型 token 另算；文档说明内置联网搜索没有免费额度。
+- 兼容接口不返回搜索来源，插件只读取模型最终的文字回答。
 
 注意：图片会发往你填写的接口地址；联网搜索通常按次另外计费；各家的搜索来源信息不一定返回，插件只读取模型最终的文字回答。
 
