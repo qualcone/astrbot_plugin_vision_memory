@@ -17,6 +17,7 @@ identified.
 import asyncio
 import base64
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -66,6 +67,16 @@ CACHE_DAYS = 7  # how long an identification is reused (setting; 0 = no cache)
 CACHE_MAX = 200
 CACHE_DIST = 4  # max differing bits (of 64) for two images to count as the same picture
 CACHE_KV_KEY = "id_cache_v1"
+# Stickers (表情包) are only identified when the user actually asks about them. A picture counts
+# as sticker-like when the platform flags it, or it is small (bytes / pixels); animated GIFs are
+# always skipped.
+STICKER_MODES = ("ask_only", "always")
+STICKER_MAX_BYTES = 60 * 1024
+STICKER_MAX_SIDE = 512
+DEFAULT_ASK_KEYWORDS = [
+    "谁", "什么", "哪个", "哪部", "哪里", "哪儿", "叫啥", "出自", "认识", "认得", "角色", "识别", "是不是", "是哪",
+    "是啥", "知道吗", "来源", "名字", "作品", "出处", "什么梗", "吗", "？", "?",
+]
 TOTAL_TIMEOUT = 60  # seconds the whole identification of one image may take (setting)
 TOTAL_TIMEOUT_MIN = 15
 STEP3_MIN_SECONDS = 10  # skip the web profile search when less time than this is left
@@ -87,6 +98,8 @@ GROUP_OF = {
     "ds_timeout": "gemini",
     "ds_send_image": "gemini",
     "ds_prompt": "gemini",
+    "sticker_mode": "speed",
+    "ask_keywords": "speed",
     "total_timeout": "speed",
     "cache_days": "speed",
     "verify_enable": "verify",
@@ -495,6 +508,25 @@ def _fetch_page(url: str, body_chars: int = PAGE_BODY_CHARS) -> dict:
     return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, body_chars)}
 
 
+def _image_side(image: bytes):
+    """Longest side in pixels, or None (no Pillow / not an image)."""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image)) as im:
+            return max(im.size)
+    except Exception:
+        return None
+
+
+def _sticker_like(image: bytes, flagged: bool) -> bool:
+    """A sticker per the platform flag, or a small picture (few bytes, few pixels)."""
+    if flagged or len(image) < STICKER_MAX_BYTES:
+        return True
+    side = _image_side(image)
+    return side is not None and side <= STICKER_MAX_SIDE
+
+
 def _dhash(image: bytes):
     """64-bit difference hash of an image, or None (no Pillow, not an image, or too flat
     to tell apart). Re-compressed copies of the same picture differ in only a few bits."""
@@ -858,6 +890,41 @@ class VisionMemory(Star):
         except Exception as e:
             logger.warning(f"[vision_memory] cache save failed: {type(e).__name__}")
 
+    def _sticker_mode(self) -> str:
+        m = str(self._c("sticker_mode", "ask_only") or "ask_only").strip()
+        return m if m in STICKER_MODES else "ask_only"
+
+    def _asked(self, text: str) -> bool:
+        """Did the user ask something? Placeholders like [图片] don't count; with keywords
+        configured the text must contain one (question words, ? ...), with an empty
+        keyword list any text counts."""
+        t = re.sub(r"\[[^\]]{0,12}\]", "", text or "").strip().lower()
+        if not t:
+            return False
+        raw = self._c("ask_keywords", DEFAULT_ASK_KEYWORDS)
+        if isinstance(raw, str):
+            raw = raw.replace("，", ",").replace("\n", ",").split(",")
+        kws = [str(k).strip().lower() for k in raw if str(k).strip()] if isinstance(raw, (list, tuple)) else DEFAULT_ASK_KEYWORDS
+        return True if not kws else any(k in t for k in kws)
+
+    @staticmethod
+    def _sticker_flags(event) -> list:
+        """One bool per image of the message: did the platform mark it as a sticker?
+        (QQ sets subType 1 / a summary like [动画表情].)"""
+        try:
+            import astrbot.api.message_components as Comp
+
+            out = []
+            for comp in event.get_messages():
+                if isinstance(comp, Comp.Image):
+                    st = getattr(comp, "subType", None)
+                    if st is None:
+                        st = getattr(comp, "sub_type", None)
+                    out.append(st == 1 or "表情" in str(getattr(comp, "summary", "") or ""))
+            return out
+        except Exception:
+            return []
+
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
             self._warned.add(key)
@@ -929,7 +996,7 @@ class VisionMemory(Star):
         processed = False
         try:
             if req.image_urls:
-                processed = await self._identify(req)
+                processed = await self._identify(req, self._sticker_flags(event))
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] identify stage crashed: {type(e).__name__}: {e}")
         try:
@@ -958,7 +1025,7 @@ class VisionMemory(Star):
             logger.warning(f"[vision_memory] debug dump failed: {type(e).__name__}")
 
     # ---- the three steps ----
-    async def _identify(self, req: ProviderRequest) -> bool:
+    async def _identify(self, req: ProviderRequest, flags=None) -> bool:
         """Identify every image of the message and append the result to the user
         message. Images that were identified are removed; the others are kept so
         the main model can still look at them. Returns True if anything was added."""
@@ -975,7 +1042,8 @@ class VisionMemory(Star):
                 kept.append(url)
                 continue
             t0 = time.monotonic()
-            text, identified, tag = await self._identify_one(url, user_text, vkey, gkey)
+            flag = bool(flags and len(flags) == len(req.image_urls) and flags[i - 1])
+            text, identified, tag = await self._identify_one(url, user_text, vkey, gkey, flag)
             if text is None:  # skipped on purpose (e.g. animated sticker): nothing is added
                 kept.append(url)
                 continue
@@ -1006,7 +1074,7 @@ class VisionMemory(Star):
         logger.info(f"[vision_memory] identified {len(parts) - len(kept)}/{len(parts)} image(s); {len(kept)} kept for the main model")
         return True
 
-    async def _identify_one(self, url, user_text, vkey, gkey):
+    async def _identify_one(self, url, user_text, vkey, gkey, flagged=False):
         """Returns (text for the main model, identified?, short tag). Never raises."""
         t_start = time.monotonic()
         try:
@@ -1016,6 +1084,9 @@ class VisionMemory(Star):
             return "(图片无法读取，未识别)", False, ""
         if _sniff_mime(image) == "image/gif":
             self._dbg("GIF 动图（多半是表情包），跳过识别以节省调用")
+            return None, False, ""
+        if self._sticker_mode() == "ask_only" and not self._asked(user_text) and _sticker_like(image, flagged):
+            self._dbg("看起来是表情包，而且消息里没有提问，跳过识别（问了才识别；可在“速度、缓存与表情包”里改成总是识别）")
             return None, False, ""
 
         # cache: the same picture, or a re-compressed copy of it, is not identified twice
