@@ -47,6 +47,8 @@ PAGE_TIMEOUT = 8  # seconds per page when the plugin fetches pages itself
 PAGE_MAX_BYTES = 300_000
 PAGE_BODY_CHARS = 600
 PAGES_TEXT_CHARS = 3500
+VERIFY_TIMEOUT = 120
+VERIFY_STYLES = ("chat", "responses")
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
 CACHE_TTL = 3600  # seconds a finished identification is reused for the same image
@@ -61,6 +63,12 @@ GROUP_OF = {
     "reverse_proxy": "reverse",
     "reader": "gemini",
     "reader_provider": "gemini",
+    "verify_style": "verify",
+    "verify_base_url": "verify",
+    "verify_api_key": "verify",
+    "verify_model": "verify",
+    "verify_extra": "verify",
+    "verify_prompt": "verify",
     "profile_search": "profile",
     "profile_prompt": "profile",
     "gemini_api_key": "gemini",
@@ -92,6 +100,16 @@ DEFAULT_PROFILE_PROMPT = (
     "对象：名字（类型，可信度 高/中/低）；认不出写“未确定”\n"
     "设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n"
     "其他可能：难分的其他候选，没有就写“无”\n"
+    "依据：来源"
+)
+DEFAULT_VERIFY_PROMPT = (
+    "你是识图助手，任务是用你的联网搜索能力核实图中对象是谁。问题里会给出已知线索（可能有误，也可能为空，仅供参考）。\n"
+    "请联网查证图中对象的名字、出处和外貌设定（发色发型、瞳色、肤色、服饰、标志性特征、人设要点），并对照图片核对。"
+    "与已知线索冲突时，以你搜索到的可靠资料（萌娘百科、维基、官方站）为准，并在依据里说明分歧。\n"
+    "只写搜索结果里出现的内容，不要凭记忆补充，不要编造。输出四行：\n"
+    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认不出写“未确定”\n"
+    "出处：作品名，或真人的身份；不知道写“未知”\n"
+    "设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n"
     "依据：来源"
 )
 DEFAULT_GUIDANCE = (
@@ -442,6 +460,119 @@ def _temp_part(text: str):
         return None
 
 
+class ModelApiError(Exception):
+    pass
+
+
+def _same_name(a: str, b: str) -> bool:
+    """Same subject? Compares the names only (drops any trailing parenthesised note)."""
+
+    def core(v):
+        return re.split(r"[（(]", v or "")[0].strip().lower()
+
+    x, y = core(a), core(b)
+    return bool(x) and bool(y) and (x in y or y in x)
+
+
+def _sse_text(resp, style: str) -> str:
+    parts = []
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            ev = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if isinstance(ev.get("error"), dict):
+            raise ModelApiError(f"{_clip(ev['error'].get('message', ''), 150)}")
+        if style == "responses":
+            if ev.get("type") == "response.output_text.delta" and isinstance(ev.get("delta"), str):
+                parts.append(ev["delta"])
+        else:
+            for ch in ev.get("choices") or []:
+                d = (ch.get("delta") or {}).get("content") if isinstance(ch, dict) else None
+                if isinstance(d, str):
+                    parts.append(d)
+    return "".join(parts).strip()
+
+
+def _json_text(data, style: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    if isinstance(data.get("error"), dict):
+        raise ModelApiError(_clip(data["error"].get("message", ""), 150) or "接口返回错误")
+    if style == "responses":
+        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+            return data["output_text"].strip()
+        out = []
+        for item in data.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "message":
+                for c in item.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") in ("output_text", "text") and isinstance(c.get("text"), str):
+                        out.append(c["text"])
+        return "".join(out).strip()
+    ch = (data.get("choices") or [{}])[0]
+    content = (ch.get("message") or {}).get("content") if isinstance(ch, dict) else None
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _model_request(style, base, key, model, system, ask, image, extra, timeout) -> str:
+    """Blocking call to a vendor model API that has web search built in (the search
+    is switched on through `extra`, e.g. {"enable_search": true}). The key goes only
+    into the Authorization header of this request; redirects are not followed.
+    style "chat": POST {base}/chat/completions; style "responses": POST {base}/responses."""
+    data_url = f"data:{_sniff_mime(image)};base64,{base64.b64encode(image).decode('ascii')}"
+    base = base.rstrip("/")
+    if style == "responses":
+        url = base if base.endswith("/responses") else base + "/responses"
+        body = {"model": model, "input": [{"role": "user", "content": [{"type": "input_text", "text": ask}, {"type": "input_image", "image_url": data_url}]}]}
+        if system:
+            body["instructions"] = system
+    else:
+        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+        body = {"model": model, "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {"url": data_url}}]},
+        ]}
+    for k, v in (extra or {}).items():
+        if k not in ("model", "messages", "input"):
+            body[k] = v
+    stream = body.get("stream") is True
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "text/event-stream" if stream else "application/json",
+        },
+    )
+    try:
+        with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as r:
+            if stream or r.headers.get_content_type() == "text/event-stream":
+                return _sse_text(r, style)
+            data = json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8") or "{}").get("error")
+            msg = err.get("message", "") if isinstance(err, dict) else str(err or "")
+        except Exception:
+            msg = ""
+        raise ModelApiError(f"HTTP {e.code} {_clip(msg, 150)}".strip())
+    except ValueError:
+        raise ModelApiError("返回内容不是有效的 JSON")
+    return _json_text(data, style)
+
+
 def _has_setting(value: str) -> bool:
     v = (value or "").strip()
     return _known(v) and len(v) >= 6
@@ -500,6 +631,22 @@ class VisionMemory(Star):
             return bool((self._c("reader_provider") or "").strip())
         return bool((self._c("gemini_api_key") or "").strip())
 
+    def _verify_ready(self) -> bool:
+        return all((self._c(k) or "").strip() for k in ("verify_base_url", "verify_api_key", "verify_model"))
+
+    def _verify_extra(self) -> dict:
+        raw = (self._c("verify_extra") or "").strip()
+        if not raw:
+            return {}
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                return d
+        except ValueError:
+            pass
+        self._warn_once("verify_extra", "[vision_memory] 第四步“额外请求参数”不是有效的 JSON 对象，已忽略。")
+        return {}
+
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
             self._warned.add(key)
@@ -519,9 +666,9 @@ class VisionMemory(Star):
             reader = self._reader()
             who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}" if reader == "astrbot" else f"Gemini 密钥={has('gemini_api_key')}"
             logger.info(
-                "[vision_memory] 已加载：Google Vision 密钥=%s，第二步=%s，%s，联网搜索资料=%s，LivingMemory 密钥=%s，行为指引=%s"
+                "[vision_memory] 已加载：Google Vision 密钥=%s，第二步=%s，%s，第四步联网核实=%s，联网搜索资料=%s，LivingMemory 密钥=%s，行为指引=%s"
                 % (
-                    has("gv_api_key"), reader, who,
+                    has("gv_api_key"), reader, who, "已配置" if self._verify_ready() else "未配置",
                     ("开" if reader == "gemini" else "不支持") if self._c("profile_search", True) else "关",
                     has("lm_api_key"),
                     "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
@@ -647,58 +794,85 @@ class VisionMemory(Star):
             self._dbg("同一张图一小时内已识别过，直接使用上次的结果")
             return hit[1], True, hit[2]
 
-        # step 1: pages on the web that contain this image
+        # step 1: pages on the web that contain this image (Google Cloud Vision)
         vproxy = (self._c("reverse_proxy") or "").strip()
+        found, fail_text = None, "以图搜图没有找到相关网页，无法确认。"
         try:
             found = await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30)
         except ReverseError as e:
             logger.warning(f"[vision_memory] {e}")
-            return "以图搜图失败，无法确认。", False, ""
+            fail_text = "以图搜图失败，无法确认。"
         except asyncio.TimeoutError:
             logger.warning("[vision_memory] Google Vision timed out")
-            return "以图搜图超时，无法确认。", False, ""
+            fail_text = "以图搜图超时，无法确认。"
         except Exception as e:
             logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
-            return "以图搜图失败，无法确认。", False, ""
-        if not found:
+            fail_text = "以图搜图失败，无法确认。"
+        verify_ready = self._verify_ready()
+        if not found and not verify_ready:
             self._dbg("Google Vision 没有找到相关网页")
-            return "以图搜图没有找到相关网页，无法确认。", False, ""
-        summary = _format_found(found)
-        self._dbg(f"Google Vision 结果:\n{summary}")
+            return fail_text, False, ""
+        summary = _format_found(found) if found else ""
+        self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果，直接交给第四步的联网模型")
 
-        # step 2: a model reads those pages and says which work / character this is
-        try:
-            conclusion = await self._read(image, user_text, found, summary, gkey)
-        except Exception as e:
-            logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
-            conclusion = ""
-        if not conclusion:
-            return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
+        raw = ""  # the model's own text, passed through when it ignores the answer format
+        obj = src = setting = evidence = candidates = ""
+        structured = False
+        if found:
+            # step 2: a model reads those pages and says who / what this is
+            try:
+                conclusion = await self._read(image, user_text, found, summary, gkey)
+            except Exception as e:
+                logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
+                conclusion = ""
+            if not conclusion and not verify_ready:
+                return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
+            if conclusion:
+                obj = _field(conclusion, "对象") or _field(conclusion, "角色")
+                src = _field(conclusion, "出处") or _field(conclusion, "作品")
+                setting, evidence = _field(conclusion, "设定"), _field(conclusion, "依据")
+                if obj or src:
+                    structured = True
+                    # step 3: look the subject up on the web: its profile / appearance details, or, when
+                    # only the work is known, match the character against the work's cast
+                    if (
+                        self._c("profile_search", True)
+                        and self._reader() == "gemini"
+                        and (_known(obj) or _known(src))
+                        and not (_known(obj) and _has_setting(setting))
+                    ):
+                        try:
+                            p_obj, p_setting, candidates, p_evid = await self._gemini_profile(image, user_text, obj, src, summary, gkey)
+                        except Exception as e:
+                            logger.warning(f"[vision_memory] profile lookup failed: {type(e).__name__}: {e}")
+                            p_obj, p_setting, candidates, p_evid = "", "", "", ""
+                        if not _known(obj) and _known(p_obj):
+                            obj = p_obj
+                        if _has_setting(p_setting):
+                            setting = p_setting
+                        if p_evid:
+                            evidence = (evidence + "；" if evidence else "") + "资料核对：" + p_evid
+                else:
+                    raw = conclusion
 
-        obj = _field(conclusion, "对象") or _field(conclusion, "角色")
-        src = _field(conclusion, "出处") or _field(conclusion, "作品")
-        setting, evidence = _field(conclusion, "设定"), _field(conclusion, "依据")
-        if obj or src:  # structured answer
-            candidates = ""
-            if (
-                self._c("profile_search", True)
-                and self._reader() == "gemini"
-                and (_known(obj) or _known(src))
-                and not (_known(obj) and _has_setting(setting))
-            ):
-                # look the subject up on the web: its profile / appearance details, or, when only
-                # the work is known, match the character against the work's cast
-                try:
-                    p_obj, p_setting, candidates, p_evid = await self._gemini_profile(image, user_text, obj, src, summary, gkey)
-                except Exception as e:
-                    logger.warning(f"[vision_memory] profile lookup failed: {type(e).__name__}: {e}")
-                    p_obj, p_setting, candidates, p_evid = "", "", "", ""
-                if not _known(obj) and _known(p_obj):
-                    obj = p_obj
-                if _has_setting(p_setting):
-                    setting = p_setting
-                if p_evid:
-                    evidence = (evidence + "；" if evidence else "") + "资料核对：" + p_evid
+        # step 4 (optional): another model with built-in web search verifies / fills in
+        if verify_ready:
+            v = await self._verify(image, user_text, obj, src, setting, summary)
+            if v:
+                structured, raw = True, ""
+                if _known(v["obj"]) and not _known(obj):
+                    obj = v["obj"]
+                elif _known(v["obj"]) and _known(obj) and not _same_name(obj, v["obj"]):
+                    other = f"二次核实认为 {v['obj']}"
+                    candidates = (candidates + "；" if _known(candidates) else "") + other
+                if _known(v["src"]) and not _known(src):
+                    src = v["src"]
+                if _has_setting(v["setting"]) and not _has_setting(setting):
+                    setting = v["setting"]
+                if v["evidence"]:
+                    evidence = (evidence + "；" if evidence else "") + "二次核实：" + v["evidence"]
+
+        if structured:
             identified = _known(obj) or _known(src)
             tag = _clip(" / ".join(x for x in (obj, src) if _known(x)), 80)
             lines = [f"对象：{obj or '未确定'}"]
@@ -711,16 +885,17 @@ class VisionMemory(Star):
             if evidence:
                 lines.append(f"依据：{evidence}")
             conclusion = "识别结论：\n" + "\n".join(lines)
-        else:  # the model ignored the format: pass its text through
-            identified = "无法确认" not in conclusion
-            tag = ""
+        elif raw:
+            conclusion, identified, tag = raw, "无法确认" not in raw, ""
+        else:
+            return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
 
-        # step 3: the conclusion goes to the main model. This text is saved in the
-        # chat history and re-sent with every later turn, so it is kept short.
+        # the conclusion goes to the main model. This text is saved in the chat history and
+        # re-sent with every later turn, so it is kept short.
         conclusion = _clip(conclusion, MAX_NOTE_CHARS)
-        if identified and found["pages"]:
+        if identified and found and found["pages"]:
             conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:2])
-        elif not identified:  # still hand over what Google found, the main model may make sense of it
+        elif not identified and summary:  # still hand over what Google found, the main model may make sense of it
             conclusion += "\n以图搜图找到的线索：\n" + _clip(summary, 500)
         if identified:
             if len(self._cache) >= CACHE_MAX:
@@ -750,6 +925,52 @@ class VisionMemory(Star):
             self._dbg(f"Gemini: 模型={model}，工具={list(tools)} {pages[:6]}；输出: {_clip(text, 600)}")
             return _clip(text, 600) if text else ""
         return ""
+
+    async def _verify(self, image, user_text, obj, src, setting, summary):
+        """Step 4: ask a vendor model that has web search built in to verify / fill in
+        the identification. Returns {"obj","src","setting","evidence"} or None."""
+        base = (self._c("verify_base_url") or "").strip()
+        if urlparse(base).scheme not in ("http", "https"):
+            self._warn_once("verify_url", "[vision_memory] 第四步“接口地址”必须以 http:// 或 https:// 开头。")
+            return None
+        style = str(self._c("verify_style", "chat") or "chat").strip()
+        style = style if style in VERIFY_STYLES else "chat"
+        system = (self._c("verify_prompt") or "").strip() or DEFAULT_VERIFY_PROMPT
+        known = (
+            f"已知线索：\n对象：{_clip(obj or '未确定', 80)}\n出处：{_clip(src or '未知', 80)}\n"
+            f"设定：{_clip(setting, 150) if _has_setting(setting) else '未读到'}\n"
+        )
+        ask = (
+            (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
+            + known
+            + (f"以图搜图找到的信息：\n{summary}\n" if summary else "以图搜图没有找到相关网页。\n")
+            + "\n请联网搜索核实图中对象是谁。"
+        )
+        try:
+            text = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _model_request, style, base, (self._c("verify_api_key") or "").strip(),
+                    (self._c("verify_model") or "").strip(), system, ask, image, self._verify_extra(), VERIFY_TIMEOUT,
+                ),
+                timeout=VERIFY_TIMEOUT + 5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[vision_memory] 第四步联网模型超时")
+            return None
+        except ModelApiError as e:
+            logger.warning(f"[vision_memory] 第四步联网模型调用失败：{e}")
+            return None
+        except Exception as e:
+            logger.warning(f"[vision_memory] 第四步联网模型调用失败：{type(e).__name__}")
+            return None
+        self._dbg(f"第四步联网模型（{style}）输出: {_clip(text, 600)}")
+        v = {
+            "obj": _field(text, "对象") or _field(text, "角色"),
+            "src": _field(text, "出处") or _field(text, "作品"),
+            "setting": _field(text, "设定"),
+            "evidence": _field(text, "依据"),
+        }
+        return v if (v["obj"] or v["src"]) else None
 
     async def _read(self, image, user_text, found, summary, gkey) -> str:
         """Step 2: the chosen model reads the pages and says which work / character."""

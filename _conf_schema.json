@@ -91,8 +91,60 @@
       }
     }
   },
+  "verify": {
+    "description": "④ 第四步：再用另一个联网模型核实（可选）",
+    "type": "object",
+    "hint": "再调一个自带联网搜索的大模型 API（通义千问、智谱、豆包、OpenAI 等），带上图片和前面的结论，让它联网核实、补全。Google 找不到网页的二次元角色也会直接交给它。图片会发往你填写的接口地址。下面“接口地址、Key、模型”三项都填了才会启用，不需要开关。",
+    "items": {
+      "verify_style": {
+        "description": "接口格式",
+        "type": "string",
+        "options": [
+          "chat",
+          "responses"
+        ],
+        "labels": [
+          "Chat Completions（多数厂商）",
+          "Responses API（OpenAI、豆包、通义等）"
+        ],
+        "default": "chat",
+        "hint": "按厂商文档选：chat 是 POST {接口地址}/chat/completions，responses 是 POST {接口地址}/responses。"
+      },
+      "verify_base_url": {
+        "description": "接口地址",
+        "type": "string",
+        "default": "",
+        "hint": "例如 https://api.openai.com/v1 或厂商给出的兼容地址。不要带 /chat/completions。Key 会发往此地址，请只填可信地址。"
+      },
+      "verify_api_key": {
+        "description": "API Key",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "该厂商的 API Key。只保存在本插件配置中，不写入日志。"
+      },
+      "verify_model": {
+        "description": "模型",
+        "type": "string",
+        "default": "",
+        "hint": "需要支持图片输入，并且能联网搜索。填厂商文档里的模型名。"
+      },
+      "verify_extra": {
+        "description": "额外请求参数（JSON）",
+        "type": "text",
+        "default": "",
+        "hint": "用来打开该厂商的联网搜索，原样合并进请求体。例如通义千问：{\"enable_search\": true}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}；OpenAI/豆包 Responses：{\"tools\": [{\"type\": \"web_search\"}]}。需要流式输出的厂商加 \"stream\": true。具体写法请以厂商文档为准。"
+      },
+      "verify_prompt": {
+        "description": "核实提示词",
+        "type": "text",
+        "default": "你是识图助手，任务是用你的联网搜索能力核实图中对象是谁。问题里会给出已知线索（可能有误，也可能为空，仅供参考）。\n请联网查证图中对象的名字、出处和外貌设定（发色发型、瞳色、肤色、服饰、标志性特征、人设要点），并对照图片核对。与已知线索冲突时，以你搜索到的可靠资料（萌娘百科、维基、官方站）为准，并在依据里说明分歧。\n只写搜索结果里出现的内容，不要凭记忆补充，不要编造。输出四行：\n对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认不出写“未确定”\n出处：作品名，或真人的身份；不知道写“未知”\n设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n依据：来源",
+        "hint": "发给该模型的指令，可修改，清空用内置默认。建议保留输出四行（对象 / 出处 / 设定 / 依据）的格式，插件按这些名称读取结果。"
+      }
+    }
+  },
   "guidance": {
-    "description": "④ 第四步：给主模型的提示",
+    "description": "⑤ 第五步：给主模型的提示",
     "type": "object",
     "items": {
       "guidance_text": {
@@ -104,7 +156,7 @@
     }
   },
   "memory": {
-    "description": "⑤ 长期记忆（LivingMemory）",
+    "description": "⑥ 长期记忆（LivingMemory）",
     "type": "object",
     "items": {
       "lm_api_url": {
@@ -134,7 +186,7 @@
     "hint": "写入角色记忆所需。需先在 LivingMemory 启用 external_api，并用 /lmem apikey 创建同时具备 read 和 write 权限的 Key。"
   },
   "debug": {
-    "description": "⑥ 调试",
+    "description": "⑦ 调试",
     "type": "object",
     "items": {
       "log_caption": {
