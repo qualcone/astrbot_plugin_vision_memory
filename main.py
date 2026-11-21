@@ -52,8 +52,13 @@ VERIFY_TIMEOUT_MIN = 30
 VERIFY_STYLES = ("chat", "responses", "dashscope")
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
-CACHE_TTL = 3600  # seconds a finished identification is reused for the same image
-CACHE_MAX = 64
+CACHE_DAYS = 7  # how long an identification is reused (setting; 0 = no cache)
+CACHE_MAX = 200
+CACHE_DIST = 4  # max differing bits (of 64) for two images to count as the same picture
+CACHE_KV_KEY = "id_cache_v1"
+TOTAL_TIMEOUT = 60  # seconds the whole identification of one image may take (setting)
+TOTAL_TIMEOUT_MIN = 15
+STEP3_MIN_SECONDS = 10  # skip the web profile search when less time than this is left
 TAG_PREFIX = "[识别："  # compact, persisted marker of an identification, e.g. [识别：灵梦 / 东方Project]
 MAX_NOTE_CHARS = 700  # cap on the text added to the user message (it is saved in the chat history)
 CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier identification
@@ -65,6 +70,8 @@ GROUP_OF = {
     "reverse_proxy": "reverse",
     "reader": "gemini",
     "reader_provider": "gemini",
+    "total_timeout": "speed",
+    "cache_days": "speed",
     "verify_enable": "verify",
     "verify_style": "verify",
     "verify_base_url": "verify",
@@ -86,36 +93,42 @@ GROUP_OF = {
     "log_caption": "debug",
 }
 
-DEFAULT_GEMINI_PROMPT = (
-    "你是识图助手。根据图片、以图搜图找到的网页信息，以及你读到的网页内容，判断图中的对象是谁（可能是动漫或游戏角色、真人、表情包等）、出处是什么。\n"
-    "以图搜图的结果是主要线索：有很多张完全相同的图片、或多个网页指向同一个名字，就足以给出结论。\n"
-    "网页打不开时，也依据以图搜图给出的最佳猜测、网络实体、完全相同的图片数量和网页标题来判断。\n"
-    "如实说出你掌握的信息，不要编造。“设定”只写网页里读到的内容，读不到就写“未读到”，不要凭记忆补充。输出四行：\n"
-    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认出了出处但认不准是谁写“未确定”；完全没有线索写“无法确认”\n"
-    "出处：作品名，或真人的身份；不知道写“未知”\n"
-    "设定：外貌与人设要点（发色发型、瞳色、肤色、服饰、身份、标志性特征）；读不到写“未读到”\n"
-    "依据：哪个网页或线索的什么信息"
-)
-DEFAULT_PROFILE_PROMPT = (
-    "你是识图助手，任务是联网搜索核实并补充资料。已知线索会在问题里给出（对象、出处）。\n"
-    "1. 对象已知：搜索它的基本资料（萌娘百科、维基、官方站等），重点是外貌设定（发色发型、瞳色、肤色、服饰、标志性特征）、身份和人设要点，并对照图片核对是否一致。\n"
-    "2. 对象未确定但出处已知：先搜索这部作品的角色列表，按图中人物的外貌逐个比对，找出最像的。\n"
-    "只写搜索结果里出现的内容，不要凭记忆补充，不要编造；资料冲突时以萌娘百科、官方资料为准。输出四行：\n"
-    "对象：名字（类型，可信度 高/中/低）；认不出写“未确定”\n"
-    "设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n"
-    "其他可能：难分的其他候选，没有就写“无”\n"
-    "依据：来源"
-)
-DEFAULT_VERIFY_PROMPT = (
-    "你是识图助手，任务是用你的联网搜索能力核实图中对象是谁。问题里会给出已知线索（可能有误，也可能为空，仅供参考）。\n"
-    "请联网查证图中对象的名字、出处和外貌设定（发色发型、瞳色、肤色、服饰、标志性特征、人设要点），并对照图片核对。"
-    "与已知线索冲突时，以你搜索到的可靠资料（萌娘百科、维基、官方站）为准，并在依据里说明分歧。\n"
-    "只写搜索结果里出现的内容，不要凭记忆补充，不要编造。输出四行：\n"
-    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认不出写“未确定”\n"
-    "出处：作品名，或真人的身份；不知道写“未知”\n"
-    "设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n"
-    "依据：来源"
-)
+DEFAULT_GEMINI_PROMPT = "\n".join([
+    "你是二次元角色识别专家。根据图片、以图搜图找到的网页信息，以及你读到的网页内容，判断图中的对象是谁（动漫或游戏角色、真人、表情包等）、出处是什么。",
+    "1. 先看图，记下能区分角色的强特征：发型发色（含刘海、发饰位置）、瞳色眼型、服装（领结领带的颜色形状等）、配饰道具、画风、画面文字；金发、蓝眼这类常见特征只算弱特征。",
+    "2. 以图搜图的结果是候选来源：多个网页或实体指向同一个名字，或有很多张完全相同的图，就足以给出结论；网页打不开时，也看标题、最佳猜测、网络实体。",
+    "3. 把候选的设定（网页里读到的外貌和人设）和图中特征逐项对照，吻合的和不吻合的都要记下。至少 2～3 个强特征吻合，再加 1 个线索，才给高置信度；有明显不吻合就降低置信度或换候选。同人图、换装、画师风格会让特征偏移；冷门角色主动标低置信度。",
+    "如实说出你掌握的信息，不要编造。“设定”只写网页里读到的内容，读不到就写“未读到”，不要凭记忆补充。每项写成一行，不要换行。输出四行：",
+    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认出了出处但认不准是谁写“未确定”；完全没有线索写“无法确认”",
+    "出处：作品名，或真人的身份；不知道写“未知”",
+    "设定：外貌与人设要点（发色发型、瞳色、肤色、服饰、身份、标志性特征）；读不到写“未读到”",
+    "依据：吻合的强特征、不吻合的特征、信息来自哪个网页或线索",
+])
+DEFAULT_PROFILE_PROMPT = "\n".join([
+    "你是识图助手，任务是联网搜索核实并补充资料。已知线索会在问题里给出（对象、出处，可能有误）。",
+    "1. 对象已知：搜索它的基本资料（用“作品名 + 角色名”搜，看萌娘百科、维基、官方站），重点是外貌设定（发色发型、瞳色、肤色、服饰、标志性特征）、身份和人设要点；把资料里的外貌和图中特征逐项对照，写出吻合和不吻合的地方。不吻合明显时，把可信度调低，并再搜一下有没有更像的候选。",
+    "2. 对象未确定但出处已知：先搜索这部作品的角色列表，按图中人物的强特征（发色发型、瞳色、服装、配饰）逐个比对，找出最像的，再按第 1 点核对。",
+    "只写搜索结果里出现的内容，不要凭记忆补充，不要编造；资料冲突时以萌娘百科、官方资料为准。每项写成一行，不要换行。输出四行：",
+    "对象：名字（类型，可信度 高/中/低）；认不出写“未确定”",
+    "设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”",
+    "其他可能：难分的其他候选，没有就写“无”",
+    "依据：吻合和不吻合的特征，信息来源",
+])
+DEFAULT_VERIFY_PROMPT = "\n".join([
+    "你是二次元角色识别专家，要识别图中的主要对象（动漫或游戏角色、真人、表情包等），可以联网搜索。问题里会给出已知线索（可能有误，也可能没有，仅供参考）。按下面的流程做，过程不要输出，最后只输出四行结果。",
+    "1. 提取特征：先仔细看图，把能区分角色的特征逐项记下——发型（颜色、长度、刘海、发饰位置）、瞳色与眼型、服装（款式、领结领带的颜色和形状）、配饰与道具、画风（上色方式、哪家会社或哪部作品的视觉特征）、画面里的文字和 Logo。区分强特征（独特的组合）和弱特征（金发、蓝眼这类常见特征）。",
+    "2. 生成候选：用强特征的组合列出 2～3 个候选；画面文字、Logo 和画风可以先圈定作品范围。",
+    "3. 联网核实：用“作品名 + 角色名 + 关键特征”搜索，不要只搜“白发红瞳”这类泛特征；读角色的萌娘百科、维基或官方资料，把资料里的外貌设定和你记下的特征逐项对照，看哪些吻合、哪些不吻合。",
+    "4. 下结论：至少 2～3 个强特征吻合，再加 1 个设定线索，才给高置信度；只有 1 个吻合最多给低；有明显不吻合的特征要降低置信度或换候选。同人图、换装、画师风格会让特征偏移，要考虑；冷门或原创角色主动标低置信度。搜不到、对不上就写“无法确认”，不要编造。",
+    "只写搜索结果里出现的和图中能看到的内容，不要凭记忆补充设定。每项写成一行，不要换行。输出四行：",
+    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认出了出处但认不准是谁写“未确定”；完全没有线索写“无法确认”",
+    "出处：作品名，或真人的身份；不知道写“未知”",
+    "设定：外貌与人设要点（发色发型、瞳色、肤色、服饰、身份、标志性特征），只写搜到的，不超过 120 字；没搜到写“未读到”",
+    "依据：吻合的强特征、不吻合的特征、信息来源（哪个页面）",
+])
+# defaults shipped by earlier versions: a saved copy of one of these is replaced by the current default
+OLD_PROFILE_DEFAULTS = ('你是识图助手，任务是联网搜索核实并补充资料。已知线索会在问题里给出（对象、出处）。\n1. 对象已知：搜索它的基本资料（萌娘百科、维基、官方站等），重点是外貌设定（发色发型、瞳色、肤色、服饰、标志性特征）、身份和人设要点，并对照图片核对是否一致。\n2. 对象未确定但出处已知：先搜索这部作品的角色列表，按图中人物的外貌逐个比对，找出最像的。\n只写搜索结果里出现的内容，不要凭记忆补充，不要编造；资料冲突时以萌娘百科、官方资料为准。输出四行：\n对象：名字（类型，可信度 高/中/低）；认不出写“未确定”\n设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n其他可能：难分的其他候选，没有就写“无”\n依据：来源',)
+OLD_VERIFY_DEFAULTS = ('你是识图助手，任务是用你的联网搜索能力核实图中对象是谁。问题里会给出已知线索（可能有误，也可能为空，仅供参考）。\n请联网查证图中对象的名字、出处和外貌设定（发色发型、瞳色、肤色、服饰、标志性特征、人设要点），并对照图片核对。与已知线索冲突时，以你搜索到的可靠资料（萌娘百科、维基、官方站）为准，并在依据里说明分歧。\n只写搜索结果里出现的内容，不要凭记忆补充，不要编造。输出四行：\n对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认不出写“未确定”\n出处：作品名，或真人的身份；不知道写“未知”\n设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n依据：来源',)
 DEFAULT_GUIDANCE = (
     '图片识别结论里的“设定”是联网查到的资料，描述外貌和人设时以它为准，不要凭印象补充。可信度高可直接采用；中或低请向用户说明不太确定；写着“无法确认”时如实告知，不要编造。核实无误后调用 save_character_memory 保存，下次可直接召回。'
 )
@@ -453,6 +466,27 @@ def _fetch_page(url: str) -> dict:
     return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, PAGE_BODY_CHARS)}
 
 
+def _dhash(image: bytes):
+    """64-bit difference hash of an image, or None (no Pillow, not an image, or too flat
+    to tell apart). Re-compressed copies of the same picture differ in only a few bits."""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image)) as im:
+            im.draft("L", (64, 64))
+            g = im.convert("L").resize((9, 8), getattr(Image, "Resampling", Image).LANCZOS)
+        px = list(g.getdata())
+        bits = 0
+        for row in range(8):
+            for col in range(8):
+                bits = (bits << 1) | (1 if px[row * 9 + col] > px[row * 9 + col + 1] else 0)
+        return bits if 10 <= bin(bits).count("1") <= 54 else None
+    except Exception:
+        return None
+
+
 def _temp_part(text: str):
     """A user-message part for this request only: AstrBot leaves parts marked as
     temporary out of the saved chat history. None if this AstrBot cannot do that."""
@@ -683,6 +717,7 @@ class VisionMemory(Star):
         self._get_broken = False
         self._warned = set()
         self._cache = {}
+        self._cache_loaded = False
         self._log_status()
 
     # ---- config / logging ----
@@ -730,6 +765,65 @@ class VisionMemory(Star):
             pass
         self._warn_once("verify_extra", "[vision_memory] 联网大模型的“额外请求参数”不是有效的 JSON 对象，已忽略。")
         return {}
+
+    def _cache_sig(self) -> str:
+        """Fingerprint of the settings that shape a result: a changed setting invalidates old entries."""
+        parts = [
+            self._reader(), (self._c("reader_provider") or ""), (self._c("gemini_model") or ""),
+            str(bool(self._c("profile_search", True))), str(self._gv_on()),
+            str(self._verify_on()), ((self._c("verify_model") or "") if self._verify_on() else ""),
+        ]
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+    async def _cache_load(self) -> None:
+        if self._cache_loaded:
+            return
+        self._cache_loaded = True
+        try:
+            data = await self.get_kv_data(CACHE_KV_KEY, {})
+            if isinstance(data, dict):
+                for k, e in data.items():
+                    if isinstance(e, dict) and isinstance(e.get("text"), str):
+                        self._cache[k] = e
+        except Exception as e:
+            logger.warning(f"[vision_memory] cache load failed: {type(e).__name__}")
+
+    def _cache_find(self, sha, dh, sig):
+        """Returns (entry, how) for the same or a near-identical picture, else (None, '')."""
+        days = _as_int(self._c("cache_days", CACHE_DAYS), CACHE_DAYS, 0, 90)
+        if not days:
+            return None, ""
+        now, ttl = time.time(), days * 86400
+        e = self._cache.get(sha)
+        if e and now - e.get("t", 0) <= ttl and e.get("sig") == sig:
+            return e, "完全相同的图片"
+        if dh is not None:
+            best, best_d = None, CACHE_DIST + 1
+            for k, e in self._cache.items():
+                if now - e.get("t", 0) > ttl or e.get("sig") != sig or not e.get("dh"):
+                    continue
+                try:
+                    d = bin(dh ^ int(e["dh"], 16)).count("1")
+                except (TypeError, ValueError):
+                    continue
+                if d < best_d:
+                    best, best_d = e, d
+            if best is not None:
+                return best, f"相似的图片（{best_d}/64 位不同，多半是同一张图被重新压缩）"
+        return None, ""
+
+    async def _cache_put(self, sha, dh, sig, text, tag) -> None:
+        days = _as_int(self._c("cache_days", CACHE_DAYS), CACHE_DAYS, 0, 90)
+        if not days:
+            return
+        self._cache[sha] = {"t": time.time(), "dh": ("%016x" % dh) if dh is not None else "", "sig": sig, "text": text, "tag": tag}
+        while len(self._cache) > CACHE_MAX:
+            oldest = min(self._cache, key=lambda k: self._cache[k].get("t", 0))
+            del self._cache[oldest]
+        try:
+            await self.put_kv_data(CACHE_KV_KEY, self._cache)
+        except Exception as e:
+            logger.warning(f"[vision_memory] cache save failed: {type(e).__name__}")
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -876,6 +970,7 @@ class VisionMemory(Star):
 
     async def _identify_one(self, url, user_text, vkey, gkey):
         """Returns (text for the main model, identified?, short tag). Never raises."""
+        t_start = time.monotonic()
         try:
             image = await asyncio.wait_for(asyncio.to_thread(_read_image, url, IMAGE_MAX_BYTES, 20), timeout=25)
         except Exception as e:
@@ -884,44 +979,100 @@ class VisionMemory(Star):
         if _sniff_mime(image) == "image/gif":
             self._dbg("GIF 动图（多半是表情包），跳过识别以节省调用")
             return None, False, ""
-        ckey = hashlib.sha1(image).hexdigest()
-        hit = self._cache.get(ckey)
-        if hit and time.monotonic() - hit[0] < CACHE_TTL:
-            self._dbg("同一张图一小时内已识别过，直接使用上次的结果")
-            return hit[1], True, hit[2]
+
+        # cache: the same picture, or a re-compressed copy of it, is not identified twice
+        await self._cache_load()
+        sha = hashlib.sha256(image).hexdigest()
+        dh = _dhash(image)
+        sig = self._cache_sig()
+        hit, how = self._cache_find(sha, dh, sig)
+        if hit:
+            self._dbg(f"缓存命中（{how}）：直接使用之前的识别结果")
+            return hit["text"], True, hit.get("tag", "")
+        self._dbg(
+            f"缓存未命中：SHA-256 {sha[:10]}，相似哈希 {('%016x' % dh) if dh is not None else '不可用（没装 Pillow 或图片太单调）'}，"
+            f"已缓存 {len(self._cache)} 张（只缓存已识别出的结果）"
+        )
+
+        total = _as_int(self._c("total_timeout", TOTAL_TIMEOUT), TOTAL_TIMEOUT, TOTAL_TIMEOUT_MIN, 600)
+        deadline = t_start + total
 
         # step 1: two independent, optional sources run at the same time:
-        #   A. Google Cloud Vision: web pages that contain this image
+        #   A. Google Cloud Vision, then the step-2 model reads the pages it found
         #   B. a vendor model with built-in web search: identifies the image on its own
+        # Neither waits for the other; whatever is not ready at the deadline is dropped.
         v_on = self._verify_on()
         reader_ok = self._reader_ready()
         gv_on = self._gv_on() and (reader_ok or v_on)  # without a step-2 model Google only cross-checks B
         vproxy = (self._c("reverse_proxy") or "").strip()
+        timing = {}
 
-        async def source_a():
-            if not gv_on:
-                return None, ""
-            try:
-                return await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30), ""
-            except ReverseError as e:
-                logger.warning(f"[vision_memory] {e}")
-                return None, "以图搜图失败，无法确认。"
-            except asyncio.TimeoutError:
-                logger.warning("[vision_memory] Google Vision timed out")
-                return None, "以图搜图超时，无法确认。"
-            except Exception as e:
-                logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
-                return None, "以图搜图失败，无法确认。"
+        async def chain_a():
+            t0 = time.monotonic()
+            found, fail = None, ""
+            if gv_on:
+                try:
+                    found = await asyncio.wait_for(asyncio.to_thread(_webdetect, vkey, image, vproxy, 25), timeout=30)
+                except ReverseError as e:
+                    logger.warning(f"[vision_memory] {e}")
+                    fail = "以图搜图失败，无法确认。"
+                except asyncio.TimeoutError:
+                    logger.warning("[vision_memory] Google Vision timed out")
+                    fail = "以图搜图超时，无法确认。"
+                except Exception as e:
+                    logger.warning(f"[vision_memory] Google Vision failed: {type(e).__name__}")
+                    fail = "以图搜图失败，无法确认。"
+            timing["Google"] = time.monotonic() - t0
+            conclusion = ""
+            if found and reader_ok:
+                t1 = time.monotonic()
+                try:
+                    conclusion = await self._read(image, user_text, found, _format_found(found), gkey)
+                except Exception as e:
+                    logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
+                timing["读网页"] = time.monotonic() - t1
+            return found, fail, conclusion
 
         async def source_b():
             if not v_on:
                 return None
-            text, err = await self._verify_raw(image, user_text, "", "", "", "")
+            t0 = time.monotonic()
+            try:
+                text, err = await self._verify_raw(image, user_text, "", "", "", "")
+            finally:
+                timing["联网大模型"] = time.monotonic() - t0
             return None if err else self._parse_answer(text)
 
-        (found, google_fail), v = await asyncio.gather(source_a(), source_b())
+        ta, tb = asyncio.ensure_future(chain_a()), asyncio.ensure_future(source_b())
+        try:
+            done, pending = await asyncio.wait({ta, tb}, timeout=max(1.0, deadline - time.monotonic()))
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        except BaseException:
+            ta.cancel()
+            tb.cancel()
+            raise
+
+        def result_of(t, default):
+            if t in done and not t.cancelled() and t.exception() is None:
+                return t.result()
+            return default
+
+        found, google_fail, conclusion = result_of(ta, (None, "", ""))
+        v = result_of(tb, None)
+        dropped = [name for name, t in (("Google 与读网页", ta), ("联网大模型", tb)) if t in pending]
+        if dropped:
+            logger.warning(f"[vision_memory] 识别总时限 {total} 秒已到，已放弃：{'、'.join(dropped)}（可在“速度与缓存”里调大）")
+        self._dbg(
+            "耗时：" + "，".join(f"{k} {x:.1f}s" for k, x in timing.items())
+            + f"；已用 {time.monotonic() - t_start:.1f}s / 总时限 {total}s"
+        )
         if not found and not v:
             self._dbg("两个来源都没有结果")
+            if dropped:
+                return "识别超时（超过总时限），无法确认。", False, ""
             return (google_fail or ("以图搜图没有找到相关网页，无法确认。" if gv_on else "联网大模型没有给出可用的结果，无法确认。")), False, ""
         summary = _format_found(found) if found else ""
         self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果（或未启用），只用联网大模型的结果")
@@ -930,12 +1081,6 @@ class VisionMemory(Star):
         obj = src = setting = evidence = candidates = ""
         structured = False
         if found and reader_ok:
-            # step 2: a model reads those pages and says who / what this is
-            try:
-                conclusion = await self._read(image, user_text, found, summary, gkey)
-            except Exception as e:
-                logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
-                conclusion = ""
             if not conclusion and not v:
                 return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
             if conclusion:
@@ -944,29 +1089,10 @@ class VisionMemory(Star):
                 setting, evidence = _field(conclusion, "设定"), _field(conclusion, "依据")
                 if obj or src:
                     structured = True
-                    # step 3: look the subject up on the web: its profile / appearance details, or, when
-                    # only the work is known, match the character against the work's cast
-                    if (
-                        self._c("profile_search", True)
-                        and self._reader() == "gemini"
-                        and (_known(obj) or _known(src))
-                        and not (_known(obj) and _has_setting(setting))
-                    ):
-                        try:
-                            p_obj, p_setting, candidates, p_evid = await self._gemini_profile(image, user_text, obj, src, summary, gkey)
-                        except Exception as e:
-                            logger.warning(f"[vision_memory] profile lookup failed: {type(e).__name__}: {e}")
-                            p_obj, p_setting, candidates, p_evid = "", "", "", ""
-                        if not _known(obj) and _known(p_obj):
-                            obj = p_obj
-                        if _has_setting(p_setting):
-                            setting = p_setting
-                        if p_evid:
-                            evidence = (evidence + "；" if evidence else "") + "资料核对：" + p_evid
                 else:
                     raw = conclusion
 
-        # merge source B's answer with what steps 2-3 found
+        # merge source B's answer with what the step-2 model found
         if v:
             structured, raw = True, ""
             if _known(v["obj"]) and not _known(obj):
@@ -989,6 +1115,40 @@ class VisionMemory(Star):
             if core and any(core in (n or "").lower() for n in names):
                 corroborated = True
                 evidence = (evidence + "；" if evidence else "") + "Google 以图搜图的网页或实体里也出现了这个名字"
+
+        # step 3, only when still needed: the web profile search (or matching the character within
+        # the work). Source B usually already brought the profile, so this is skipped then.
+        if (
+            structured
+            and self._c("profile_search", True)
+            and self._reader() == "gemini"
+            and reader_ok
+            and (_known(obj) or _known(src))
+            and not (_known(obj) and _has_setting(setting))
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining >= STEP3_MIN_SECONDS:
+                t3 = time.monotonic()
+                try:
+                    p_obj, p_setting, p_cands, p_evid = await asyncio.wait_for(
+                        self._gemini_profile(image, user_text, obj, src, summary, gkey), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[vision_memory] 联网搜索资料超过总时限，已放弃")
+                except Exception as e:
+                    logger.warning(f"[vision_memory] profile lookup failed: {type(e).__name__}: {e}")
+                else:
+                    if not _known(obj) and _known(p_obj):
+                        obj = p_obj
+                    if _has_setting(p_setting):
+                        setting = p_setting
+                    if _known(p_cands):
+                        candidates = (candidates + "；" if _known(candidates) else "") + p_cands
+                    if p_evid:
+                        evidence = (evidence + "；" if evidence else "") + "资料核对：" + p_evid
+                self._dbg(f"联网搜索资料耗时 {time.monotonic() - t3:.1f}s")
+            else:
+                self._dbg("总时限快到了，跳过联网搜索资料")
 
         if structured:
             identified = _known(obj) or _known(src)
@@ -1016,9 +1176,7 @@ class VisionMemory(Star):
         elif not identified and summary:  # still hand over what Google found, the main model may make sense of it
             conclusion += "\n以图搜图找到的线索：\n" + _clip(summary, 500)
         if identified:
-            if len(self._cache) >= CACHE_MAX:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[ckey] = (time.monotonic(), conclusion, tag)
+            await self._cache_put(sha, dh, sig, conclusion, tag)
         return conclusion, identified, tag
 
     async def _gemini_ask(self, key, image, ask, system, chains) -> str:
@@ -1052,7 +1210,9 @@ class VisionMemory(Star):
             return "", "接口地址必须以 http:// 或 https:// 开头"
         style = str(self._c("verify_style", "chat") or "chat").strip()
         style = style if style in VERIFY_STYLES else "chat"
-        system = (self._c("verify_prompt") or "").strip() or DEFAULT_VERIFY_PROMPT
+        system = (self._c("verify_prompt") or "").strip()
+        if not system or system in OLD_VERIFY_DEFAULTS:
+            system = DEFAULT_VERIFY_PROMPT
         if obj or src or summary or _has_setting(setting):
             known = (
                 f"已知线索：\n对象：{_clip(obj or '未确定', 80)}\n出处：{_clip(src or '未知', 80)}\n"
@@ -1236,9 +1396,12 @@ class VisionMemory(Star):
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
             + f"已知线索：\n对象：{_clip(obj or '未确定', 80)}\n出处：{_clip(src or '未知', 80)}\n"
-            + f"以图搜图找到的信息：\n{summary}\n\n请联网搜索核实，补充这个对象的资料。"
+            + (f"以图搜图找到的信息：\n{summary}\n\n" if summary else "\n")
+            + "请联网搜索核实，补充这个对象的资料。"
         )
-        system = (self._c("profile_prompt") or "").strip() or DEFAULT_PROFILE_PROMPT
+        system = (self._c("profile_prompt") or "").strip()
+        if not system or system in OLD_PROFILE_DEFAULTS:
+            system = DEFAULT_PROFILE_PROMPT
         text = await self._gemini_ask(key, image, ask, system, [("google_search", "url_context"), ("google_search",)])
         return _field(text, "对象"), _field(text, "设定"), _field(text, "其他可能"), _field(text, "依据")
 
