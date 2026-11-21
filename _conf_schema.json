@@ -1,21 +1,8 @@
 {
-  "caption": {
-    "description": "① 图片识别（总开关）",
-    "type": "object",
-    "hint": "消息带图片时：先用 Google 以图搜图找到含这张图的网页，再让 Gemini 读这些网页判断是谁，最后把结论交给主模型。",
-    "items": {
-      "enable_caption": {
-        "description": "图片识别",
-        "type": "bool",
-        "default": true,
-        "hint": "关闭后插件不处理图片，原图原样传给主模型。需要下面两个密钥都填好才会工作。"
-      }
-    }
-  },
   "reverse": {
-    "description": "② 第一步：Google 以图搜图",
+    "description": "① 第一步：Google 以图搜图",
     "type": "object",
-    "hint": "用图片本身去 Google Cloud Vision 反查，得到含这张图的网页。图片会上传给 Google。",
+    "hint": "消息带图片时，用图片本身去 Google Cloud Vision 反查，得到含这张图的网页。图片会上传给 Google。下面两个密钥都填好，图片识别才会工作。",
     "items": {
       "gv_api_key": {
         "description": "Google Cloud Vision API Key",
@@ -33,7 +20,7 @@
     }
   },
   "gemini": {
-    "description": "③ 第二步：Gemini 读取网页",
+    "description": "② 第二步：Gemini 读取网页",
     "type": "object",
     "hint": "插件直接请求 Gemini（不经过 AstrBot 的提供商），让它自己打开上一步找到的网页并判断。图片和密钥会发往下面的接口地址。",
     "items": {
@@ -65,25 +52,19 @@
     }
   },
   "guidance": {
-    "description": "④ 第三步：给主模型的提示",
+    "description": "③ 第三步：给主模型的提示",
     "type": "object",
     "items": {
-      "enable_guidance": {
-        "description": "追加行为指引",
-        "type": "bool",
-        "default": true,
-        "hint": "识别图片后，在主模型的系统提示词末尾追加一小段话：识别结论有依据就直接用，无法确认就如实说，核实后保存到 LivingMemory。"
-      },
       "guidance_text": {
         "description": "行为指引内容",
         "type": "text",
-        "default": "图片描述里的“识别结论”若写明了依据，可直接采用；写着“无法确认”时，请如实告诉用户不确定，不要编造。核实无误后调用 save_character_memory 保存该角色，下次可直接召回。",
-        "hint": "可自行修改。引用了本插件的 save_character_memory 工具。"
+        "default": "图片描述里的“识别结论”带有可信度和依据：可信度高可直接采用；中或低请向用户说明不太确定；写着“无法确认”时如实告诉用户，不要编造。核实无误后调用 save_character_memory 保存该角色，下次可直接召回。",
+        "hint": "识别图片后，追加到主模型系统提示词末尾的一小段话。清空则不追加。引用了本插件的 save_character_memory 工具。"
       }
     }
   },
   "memory": {
-    "description": "⑤ 长期记忆（LivingMemory）",
+    "description": "④ 长期记忆（LivingMemory）",
     "type": "object",
     "items": {
       "lm_api_url": {
@@ -113,7 +94,7 @@
     "hint": "写入角色记忆所需。需先在 LivingMemory 启用 external_api，并用 /lmem apikey 创建同时具备 read 和 write 权限的 Key。"
   },
   "debug": {
-    "description": "⑥ 调试",
+    "description": "⑤ 调试",
     "type": "object",
     "items": {
       "log_caption": {

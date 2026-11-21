@@ -44,14 +44,12 @@ CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier identific
 
 # Settings live in groups (menus in the AstrBot panel), in processing order.
 GROUP_OF = {
-    "enable_caption": "caption",
     "gv_api_key": "reverse",
     "reverse_proxy": "reverse",
     "gemini_api_key": "gemini",
     "gemini_model": "gemini",
     "gemini_base_url": "gemini",
     "gemini_proxy": "gemini",
-    "enable_guidance": "guidance",
     "guidance_text": "guidance",
     "lm_api_url": "memory",
     "lm_api_key": "memory",
@@ -61,12 +59,20 @@ GROUP_OF = {
 
 DEFAULT_GEMINI_PROMPT = (
     "你是识图助手。根据图片、以图搜图找到的网页信息，以及你读到的网页内容，判断图中的角色（或主体）是谁、出自哪部作品。\n"
-    "只采信网页里能和图片对上的信息；对不上，或网页读不到，就写“无法确认”，不要编造。\n"
-    "只输出一行：识别结论：角色名 / 作品 / 依据（哪个网页的什么信息）；无法确认就写“识别结论：无法确认”。"
+    "以图搜图的结果是主要线索：有很多张完全相同的图片、或多个网页指向同一个名字，就足以给出结论。\n"
+    "网页打不开时，也依据以图搜图给出的最佳猜测、网络实体、完全相同的图片数量和网页标题来判断。\n"
+    "如实说出你掌握的信息：有候选就给出最可能的，并标明可信度（高/中/低）和依据；几个候选难分时都列出来；"
+    "只有完全没有线索时才写“无法确认”。不要编造网页里没有的内容。\n"
+    "只输出一行：识别结论：角色名 / 作品 / 可信度 / 依据"
 )
 DEFAULT_GUIDANCE = (
+    "图片描述里的“识别结论”带有可信度和依据：可信度高可直接采用；中或低请向用户说明不太确定；"
+    "写着“无法确认”时如实告诉用户，不要编造。核实无误后调用 save_character_memory 保存该角色，下次可直接召回。"
+)
+# defaults shipped by earlier versions: a saved copy of these is replaced by the current default
+OLD_GUIDANCE_DEFAULTS = (
     "图片描述里的“识别结论”若写明了依据，可直接采用；写着“无法确认”时，请如实告诉用户不确定，不要编造。"
-    "核实无误后调用 save_character_memory 保存该角色，下次可直接召回。"
+    "核实无误后调用 save_character_memory 保存该角色，下次可直接召回。",
 )
 _CAPTION_HEADER = (
     "[以下是对用户所发图片的识别结果（以图搜图 + 阅读网页），仅供参考；"
@@ -335,21 +341,17 @@ class VisionMemory(Star):
             logger.info(f"[vision_memory][debug] {msg}")
 
     def _log_status(self) -> None:
-        """One line at load time saying what is switched on (no secrets)."""
+        """One line at load time saying what is configured (no secrets)."""
         try:
             has = lambda k: "已填" if (self._c(k) or "").strip() else "未填"
             logger.info(
-                "[vision_memory] 已加载：图片识别=%s，Google Vision 密钥=%s，Gemini 密钥=%s，行为指引=%s，LivingMemory 密钥=%s"
+                "[vision_memory] 已加载：Google Vision 密钥=%s，Gemini 密钥=%s，LivingMemory 密钥=%s，行为指引=%s"
                 % (
-                    "开" if self._c("enable_caption", True) else "关",
-                    has("gv_api_key"), has("gemini_api_key"),
-                    "开" if self._c("enable_guidance", True) else "关",
-                    has("lm_api_key"),
+                    has("gv_api_key"), has("gemini_api_key"), has("lm_api_key"),
+                    "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
                 )
             )
-            if self._c("enable_caption", True) and not (
-                (self._c("gv_api_key") or "").strip() and (self._c("gemini_api_key") or "").strip()
-            ):
+            if not ((self._c("gv_api_key") or "").strip() and (self._c("gemini_api_key") or "").strip()):
                 logger.warning("[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和“Gemini 密钥”，否则图片会原样传给主模型。")
         except Exception as e:
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
@@ -371,7 +373,7 @@ class VisionMemory(Star):
     async def on_req(self, event: AstrMessageEvent, req: ProviderRequest):
         processed = False
         try:
-            if self._c("enable_caption", True) and req.image_urls:
+            if req.image_urls:
                 processed = await self._identify(req)
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] identify stage crashed: {type(e).__name__}: {e}")
@@ -469,6 +471,8 @@ class VisionMemory(Star):
         identified = "无法确认" not in conclusion
         if identified and found["pages"]:
             conclusion += "\n依据网页：" + " ".join(p["url"] for p in found["pages"][:3])
+        elif not identified:  # still hand over what Google found, the main model may make sense of it
+            conclusion += "\n以图搜图找到的线索：\n" + summary
         return conclusion, identified
 
     async def _gemini_read(self, image, user_text, found, summary, key) -> str:
@@ -508,11 +512,13 @@ class VisionMemory(Star):
         return False
 
     def _apply_guidance(self, req: ProviderRequest, processed: bool) -> None:
-        if not self._c("enable_guidance", True):
+        guidance = (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip()
+        if not guidance:  # emptied in the settings = guidance off
             return
+        if guidance in OLD_GUIDANCE_DEFAULTS:  # unchanged copy of an older default
+            guidance = DEFAULT_GUIDANCE
         if not (processed or self._recent_identified(req)):
             return
-        guidance = (self._c("guidance_text") or "").strip() or DEFAULT_GUIDANCE
         if guidance not in (req.system_prompt or ""):
             req.system_prompt = ((req.system_prompt or "") + "\n\n" + guidance).lstrip()
 
