@@ -48,6 +48,7 @@
 | ① 第一步 · 可选 B：联网大模型 | 启用联网大模型（开关） | 关闭后不调用这个模型（配置保留）。 |
 | | 接口格式 / 接口地址 / API Key / 模型 | 三项“接口地址、Key、模型”都填好才工作。见下文“第一步 B：联网大模型”。 |
 | | 额外请求参数（JSON） | 用来打开该厂商的联网搜索，原样合并进请求体。 |
+| | 超时（秒） | 等待回答的总时长，默认 180。超时时会写出超时前收到了多少数据。 |
 | | 核实提示词 | 发给该模型的指令，可修改，清空用内置默认。 |
 | ② 第二步：读取网页并判断 | 读取网页的方式 | `Gemini 直连`（推荐）或 `AstrBot 里的模型`，见下文。 |
 | | AstrBot 提供商 | 仅“AstrBot 里的模型”方式使用，选一个已配置的对话模型。 |
@@ -91,7 +92,7 @@ Google 的网页匹配对一部分二次元角色搜不到。B 来源调一个**
 
 | 厂商 | 接口格式 | 额外请求参数示例 |
 | --- | --- | --- |
-| 通义千问（百炼） | `chat` | `{"enable_search": true, "search_options": {"forced_search": true}, "stream": true}`，详见下文 |
+| 通义千问（百炼） | `chat` | `{"enable_search": true, "search_options": {"forced_search": true}, "stream": true, "enable_thinking": false}`，详见下文 |
 | 智谱 GLM | `chat` | `{"tools": [{"type": "web_search", "web_search": {"enable": true}}]}` |
 | OpenAI / 豆包（方舟） | `responses` | `{"tools": [{"type": "web_search"}]}` |
 
@@ -100,6 +101,7 @@ Google 的网页匹配对一部分二次元角色搜不到。B 来源调一个**
 - 接口地址：`https://dashscope.aliyuncs.com/compatible-mode/v1`；官方推荐并说明后续新特性只在工作空间域名上提供，形如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。国际站（新加坡）的域名不同，Key 和模型列表也不通用。
 - 模型：要选**支持图片输入的多模态模型**，并且在支持联网搜索的列表里。官方多模态联网搜索示例用的是 `qwen3.5-plus`；Qwen3.5 / 3.6 / 3.7 / 3.8 的 Plus、Flash 系列文档里也列了。`qwen-vl-*`、`qwen3-vl-*` 文档没有提到，按不支持处理。
 - **必须加 `"stream": true`**：官方说明多模态模型开启联网搜索时，非流式会报 `Non-streaming mode does not support Web Search`。插件会自动读取流式结果。
+- **建议关闭思考模式（`"enable_thinking": false`）**：实测 `qwen3.8-flash` 默认开着思考，一次识图输出约 6600 token，其中约 6400 是思考过程，只有约 135 是真正的回答，既慢（容易超时）又多花钱（思考按输出价计费）。
 - `forced_search: true` 表示每次都强制搜索（默认由模型决定要不要搜），识图核实场景建议开启。`search_strategy` 可选 `turbo`、`max`、`agent`，多模态接口下部分模型（如 qwen4-max、qwen3.8 系列）不支持 `agent`。
 - 计费：联网搜索按次收费（每 1000 次约 3～4 元，具体看策略和地域），模型 token 另算；文档说明内置联网搜索没有免费额度。
 - 兼容接口不返回搜索来源，插件只读取模型最终的文字回答。

@@ -47,7 +47,8 @@ PAGE_TIMEOUT = 8  # seconds per page when the plugin fetches pages itself
 PAGE_MAX_BYTES = 300_000
 PAGE_BODY_CHARS = 600
 PAGES_TEXT_CHARS = 3500
-VERIFY_TIMEOUT = 120
+VERIFY_TIMEOUT = 180  # default total seconds for the vendor model (settable)
+VERIFY_TIMEOUT_MIN = 30
 VERIFY_STYLES = ("chat", "responses")
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
@@ -70,6 +71,7 @@ GROUP_OF = {
     "verify_api_key": "verify",
     "verify_model": "verify",
     "verify_extra": "verify",
+    "verify_timeout": "verify",
     "verify_prompt": "verify",
     "profile_search": "profile",
     "profile_prompt": "profile",
@@ -476,8 +478,11 @@ def _same_name(a: str, b: str) -> bool:
     return bool(x) and bool(y) and (x in y or y in x)
 
 
-def _sse_text(resp, style: str) -> str:
+def _sse_text(resp, style: str, progress=None) -> str:
+    """Assemble the answer from a server-sent-events stream. `progress` (a dict) is
+    updated as data arrives, so a caller that gave up waiting can still say what it got."""
     parts = []
+    pr = progress if progress is not None else {}
     for raw in resp:
         line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("data:"):
@@ -491,17 +496,39 @@ def _sse_text(resp, style: str) -> str:
             continue
         if not isinstance(ev, dict):
             continue
+        now = time.monotonic()
+        pr["chunks"] = pr.get("chunks", 0) + 1
+        pr.setdefault("first", now)
+        pr["last"] = now
         if isinstance(ev.get("error"), dict):
             raise ModelApiError(f"{_clip(ev['error'].get('message', ''), 150)}")
         if style == "responses":
             if ev.get("type") == "response.output_text.delta" and isinstance(ev.get("delta"), str):
                 parts.append(ev["delta"])
+            elif "reasoning" in str(ev.get("type", "")) and isinstance(ev.get("delta"), str):
+                pr["reasoning"] = pr.get("reasoning", 0) + len(ev["delta"])
         else:
             for ch in ev.get("choices") or []:
-                d = (ch.get("delta") or {}).get("content") if isinstance(ch, dict) else None
+                delta = (ch.get("delta") or {}) if isinstance(ch, dict) else {}
+                d = delta.get("content")
                 if isinstance(d, str):
                     parts.append(d)
+                rc = delta.get("reasoning_content")
+                if isinstance(rc, str):
+                    pr["reasoning"] = pr.get("reasoning", 0) + len(rc)
+        pr["text"] = "".join(parts)
     return "".join(parts).strip()
+
+
+def _progress_note(pr: dict) -> str:
+    """What had arrived when we gave up waiting (for the timeout message)."""
+    if not pr.get("chunks"):
+        return "一个数据块都没收到（服务端一直没有开始返回）"
+    now = time.monotonic()
+    return (
+        f"已收到 {pr['chunks']} 个数据块（思考 {pr.get('reasoning', 0)} 字，正文 {len(pr.get('text', ''))} 字），"
+        f"首包在 {pr['first'] - pr['t0']:.0f} 秒，最后一块在 {now - pr['last']:.0f} 秒前"
+    )
 
 
 def _json_text(data, style: str) -> str:
@@ -526,7 +553,7 @@ def _json_text(data, style: str) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-def _model_request(style, base, key, model, system, ask, image, extra, timeout) -> str:
+def _model_request(style, base, key, model, system, ask, image, extra, timeout, progress=None) -> str:
     """Blocking call to a vendor model API that has web search built in (the search
     is switched on through `extra`, e.g. {"enable_search": true}). The key goes only
     into the Authorization header of this request; redirects are not followed.
@@ -561,7 +588,7 @@ def _model_request(style, base, key, model, system, ask, image, extra, timeout) 
     try:
         with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as r:
             if stream or r.headers.get_content_type() == "text/event-stream":
-                return _sse_text(r, style)
+                return _sse_text(r, style, progress)
             data = json.loads(r.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
         try:
@@ -974,17 +1001,22 @@ class VisionMemory(Star):
             + known
             + "\n请联网搜索核实图中对象是谁。"
         )
+        timeout = _as_int(self._c("verify_timeout", VERIFY_TIMEOUT), VERIFY_TIMEOUT, VERIFY_TIMEOUT_MIN, 600)
+        prog = {"t0": time.monotonic()}
         try:
             text = await asyncio.wait_for(
                 asyncio.to_thread(
                     _model_request, style, base, (self._c("verify_api_key") or "").strip(),
-                    (self._c("verify_model") or "").strip(), system, ask, image, self._verify_extra(), VERIFY_TIMEOUT,
+                    (self._c("verify_model") or "").strip(), system, ask, image, self._verify_extra(), timeout, prog,
                 ),
-                timeout=VERIFY_TIMEOUT + 5,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning("[vision_memory] 联网大模型超时")
-            return "", "超时"
+            note = f"超时（{timeout} 秒）：{_progress_note(prog)}"
+            logger.warning(f"[vision_memory] 联网大模型{note}")
+            if prog.get("text"):
+                self._dbg(f"超时前已收到的正文: {_clip(prog['text'], 400)}")
+            return "", note
         except ModelApiError as e:
             logger.warning(f"[vision_memory] 联网大模型调用失败：{e}")
             return "", str(e)

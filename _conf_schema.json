@@ -73,7 +73,13 @@
         "description": "额外请求参数（JSON）",
         "type": "text",
         "default": "",
-        "hint": "用来打开该厂商的联网搜索，原样合并进请求体。例如通义千问（多模态模型必须流式）：{\"enable_search\": true, \"search_options\": {\"forced_search\": true}, \"stream\": true}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}；OpenAI/豆包 Responses：{\"tools\": [{\"type\": \"web_search\"}]}。具体写法请以厂商文档为准。"
+        "hint": "用来打开该厂商的联网搜索，原样合并进请求体。例如通义千问（多模态模型必须流式）：{\"enable_search\": true, \"search_options\": {\"forced_search\": true}, \"stream\": true, \"enable_thinking\": false}（enable_thinking 关闭思考，否则可能思考几千字、又慢又贵）；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}；OpenAI/豆包 Responses：{\"tools\": [{\"type\": \"web_search\"}]}。具体写法请以厂商文档为准。"
+      },
+      "verify_timeout": {
+        "description": "超时（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "等待联网大模型回答的总时长（30–600）。联网搜索加思考可能很慢；超时时日志和 /vmtest 会写出超时前收到了多少数据，方便判断是服务端没开始返回，还是在慢慢返回。"
       },
       "verify_prompt": {
         "description": "核实提示词",
