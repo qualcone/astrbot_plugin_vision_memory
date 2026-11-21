@@ -20,34 +20,55 @@
     }
   },
   "gemini": {
-    "description": "② 第二步：Gemini 读取网页",
+    "description": "② 第二步：读取网页并判断",
     "type": "object",
-    "hint": "插件直接请求 Gemini（不经过 AstrBot 的提供商），让它自己打开上一步找到的网页并判断。图片和密钥会发往下面的接口地址。",
+    "hint": "把第一步找到的网页交给一个模型，读内容后判断是哪部作品的哪个角色。可以用 Gemini（自己打开网页、还能联网搜索角色列表），也可以用 AstrBot 里配置的任意模型（由插件抓取网页文字后交给它）。",
     "items": {
+      "reader": {
+        "description": "读取网页的方式",
+        "type": "string",
+        "options": [
+          "gemini",
+          "astrbot"
+        ],
+        "labels": [
+          "Gemini 直连（推荐）",
+          "AstrBot 里的模型"
+        ],
+        "default": "gemini",
+        "hint": "Gemini 直连：插件直接请求 Gemini，由 Gemini 自己打开网页，认出作品后还会联网搜索角色列表来匹配角色。AstrBot 里的模型：用下面选的提供商，网页由插件抓取文字后交给它，不做“匹配角色”这一步；该模型最好支持图片输入，不支持会自动只用文字判断。"
+      },
+      "reader_provider": {
+        "description": "AstrBot 提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "仅“AstrBot 里的模型”方式使用。选一个已配置的对话模型。"
+      },
       "gemini_api_key": {
         "description": "Gemini API Key",
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "在 Google AI Studio 创建。只保存在本插件配置中，不写入日志。"
+        "hint": "仅“Gemini 直连”方式使用。在 Google AI Studio 创建。只保存在本插件配置中，不写入日志。"
       },
       "gemini_model": {
-        "description": "模型",
+        "description": "Gemini 模型",
         "type": "string",
         "default": "gemini-3.5-flash",
-        "hint": "需支持图片输入和读取网页（URL Context），如 gemini-3.5-flash。填写你的密钥能调用的模型名。"
+        "hint": "仅“Gemini 直连”方式使用。需支持图片输入和读取网页（URL Context），如 gemini-3.5-flash。填写你的密钥能调用的模型名。"
       },
       "gemini_base_url": {
-        "description": "接口地址",
+        "description": "Gemini 接口地址",
         "type": "string",
         "default": "https://generativelanguage.googleapis.com",
-        "hint": "官方地址一般不用改；如使用反向代理，改成代理地址（不含 /v1beta）。Key 会发往此地址，请只填可信地址。"
+        "hint": "仅“Gemini 直连”方式使用。官方地址一般不用改；如使用反向代理，改成代理地址（不含 /v1beta）。Key 会发往此地址，请只填可信地址。"
       },
       "gemini_proxy": {
-        "description": "网络代理（可选）",
+        "description": "Gemini 网络代理（可选）",
         "type": "string",
         "default": "",
-        "hint": "访问 Gemini 需要代理时填写，如 http://127.0.0.1:7890。留空则使用系统环境变量中的代理（如有）。"
+        "hint": "仅“Gemini 直连”方式使用。访问 Gemini 需要代理时填写，如 http://127.0.0.1:7890。留空则使用系统环境变量中的代理（如有）。"
       }
     }
   },

@@ -17,12 +17,15 @@ identified.
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
 from urllib.parse import quote, unquote, urlparse
 
 from astrbot.api import AstrBotConfig, logger, sp
@@ -39,6 +42,11 @@ WRITE_TIMEOUT = 85  # seconds; LivingMemory's own request limit is 90s
 PERSONA_NONE = "[%None]"
 
 MAX_IMAGES = 3  # images identified per message
+READERS = ("gemini", "astrbot")
+PAGE_TIMEOUT = 8  # seconds per page when the plugin fetches pages itself
+PAGE_MAX_BYTES = 300_000
+PAGE_BODY_CHARS = 600
+PAGES_TEXT_CHARS = 3500
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
 CACHE_TTL = 3600  # seconds a finished identification is reused for the same image
@@ -51,6 +59,8 @@ CONTEXT_LOOKBACK = 6  # recent history messages scanned for an earlier identific
 GROUP_OF = {
     "gv_api_key": "reverse",
     "reverse_proxy": "reverse",
+    "reader": "gemini",
+    "reader_provider": "gemini",
     "gemini_api_key": "gemini",
     "gemini_model": "gemini",
     "gemini_base_url": "gemini",
@@ -312,6 +322,114 @@ def _known(value: str) -> bool:
     return bool(v) and not v.startswith(_UNKNOWN)
 
 
+def _host_is_public(host: str) -> bool:
+    """True only if every address of `host` is a public one (no loopback, private,
+    link-local, reserved ...). Keeps the page fetcher away from the local network."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                return False
+        except ValueError:
+            return False
+    return bool(infos)
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        u = urlparse(newurl)
+        if u.scheme not in ("http", "https") or not _host_is_public(u.hostname or ""):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _PageText(HTMLParser):
+    """Title, description and visible text of an HTML page."""
+
+    _SKIP = {"script", "style", "noscript", "svg", "template", "head"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title, self.desc, self._body = "", "", []
+        self._skip, self._in_title, self._len = 0, False, 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        elif tag == "meta":
+            key = (a.get("name") or a.get("property") or "").lower()
+            if key in ("description", "og:description") and not self.desc:
+                self.desc = (a.get("content") or "").strip()
+            elif key == "og:title" and not self.title:
+                self.title = (a.get("content") or "").strip()
+        elif tag in self._SKIP and tag != "head":
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+        elif tag in self._SKIP and tag != "head" and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title = (self.title + " " + data).strip() if self.title else data.strip()
+        elif not self._skip and self._len < 5000:
+            t = " ".join(data.split())
+            if t:
+                self._body.append(t)
+                self._len += len(t)
+
+    @property
+    def body(self) -> str:
+        return " ".join(self._body)
+
+
+def _fetch_page(url: str) -> dict:
+    """Blocking. Fetch one public web page and extract title / description / text.
+    Raises ValueError with a short reason. Never sends any credential."""
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("不是网页链接")
+    if not _host_is_public(u.hostname):
+        raise ValueError("不是公网地址，已拒绝")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; astrbot-plugin-vision-memory)",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.build_opener(_SafeRedirect()).open(req, timeout=PAGE_TIMEOUT) as r:
+            ctype = r.headers.get_content_type()
+            if not (ctype.startswith("text/") or "html" in ctype or "xml" in ctype):
+                raise ValueError(f"不是网页（{ctype}）")
+            raw = r.read(PAGE_MAX_BYTES)
+            charset = r.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise ValueError(f"无法访问（{type(e.reason).__name__}）")
+    try:
+        html = raw.decode(charset, "replace")
+    except LookupError:
+        html = raw.decode("utf-8", "replace")
+    p = _PageText()
+    try:
+        p.feed(html)
+    except Exception:
+        pass
+    return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, PAGE_BODY_CHARS)}
+
+
 def _temp_part(text: str):
     """A user-message part for this request only: AstrBot leaves parts marked as
     temporary out of the saved chat history. None if this AstrBot cannot do that."""
@@ -367,6 +485,15 @@ class VisionMemory(Star):
             return g[key]
         return self.config.get(key, default)
 
+    def _reader(self) -> str:
+        r = str(self._c("reader", "gemini") or "gemini").strip()
+        return r if r in READERS else "gemini"
+
+    def _reader_ready(self) -> bool:
+        if self._reader() == "astrbot":
+            return bool((self._c("reader_provider") or "").strip())
+        return bool((self._c("gemini_api_key") or "").strip())
+
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
             self._warned.add(key)
@@ -383,17 +510,23 @@ class VisionMemory(Star):
         """One line at load time saying what is configured (no secrets)."""
         try:
             has = lambda k: "已填" if (self._c(k) or "").strip() else "未填"
+            reader = self._reader()
+            who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}" if reader == "astrbot" else f"Gemini 密钥={has('gemini_api_key')}"
             logger.info(
-                "[vision_memory] 已加载：Google Vision 密钥=%s，Gemini 密钥=%s，LivingMemory 密钥=%s，行为指引=%s"
+                "[vision_memory] 已加载：Google Vision 密钥=%s，第二步=%s，%s，LivingMemory 密钥=%s，行为指引=%s"
                 % (
-                    has("gv_api_key"), has("gemini_api_key"), has("lm_api_key"),
+                    has("gv_api_key"), reader, who, has("lm_api_key"),
                     "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
                 )
             )
-            if not ((self._c("gv_api_key") or "").strip() and (self._c("gemini_api_key") or "").strip()):
-                logger.warning("[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和“Gemini 密钥”，否则图片会原样传给主模型。")
+            if not ((self._c("gv_api_key") or "").strip() and self._reader_ready()):
+                logger.warning(self._missing_msg())
         except Exception as e:
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
+
+    def _missing_msg(self) -> str:
+        second = "第二步选择的 AstrBot 提供商" if self._reader() == "astrbot" else "“Gemini 密钥”"
+        return f"[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和{second}，否则图片会原样传给主模型。"
 
     @staticmethod
     def _tool_names(req) -> list:
@@ -448,8 +581,8 @@ class VisionMemory(Star):
         the main model can still look at them. Returns True if anything was added."""
         vkey = (self._c("gv_api_key") or "").strip()
         gkey = (self._c("gemini_api_key") or "").strip()
-        if not vkey or not gkey:
-            self._warn_once("nokeys", "[vision_memory] 图片识别需要同时填写“Google Vision 密钥”和“Gemini 密钥”，图片将原样传给主模型。")
+        if not vkey or not self._reader_ready():
+            self._warn_once("nokeys", self._missing_msg())
             return False
         user_text = req.prompt or ""
         parts, kept, tags = [], [], []
@@ -527,7 +660,7 @@ class VisionMemory(Star):
 
         # step 2: a model reads those pages and says which work / character this is
         try:
-            conclusion = await self._gemini_read(image, user_text, found, summary, gkey)
+            conclusion = await self._read(image, user_text, found, summary, gkey)
         except Exception as e:
             logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
             conclusion = ""
@@ -537,7 +670,7 @@ class VisionMemory(Star):
         work, char, evidence = _field(conclusion, "作品"), _field(conclusion, "角色"), _field(conclusion, "依据")
         if work or char:  # structured answer
             candidates = ""
-            if _known(work) and not _known(char):
+            if _known(work) and not _known(char) and self._reader() == "gemini":
                 # step 2b: the work is known but not the character -> match it against the work's cast
                 try:
                     m_char, candidates, m_evid = await self._gemini_match(image, user_text, work, summary, gkey)
@@ -595,6 +728,62 @@ class VisionMemory(Star):
             self._dbg(f"Gemini: 模型={model}，工具={list(tools)} {pages[:6]}；输出: {_clip(text, 600)}")
             return _clip(text, 600) if text else ""
         return ""
+
+    async def _read(self, image, user_text, found, summary, gkey) -> str:
+        """Step 2: the chosen model reads the pages and says which work / character."""
+        if self._reader() == "astrbot":
+            return await self._astrbot_read(image, user_text, found, summary)
+        return await self._gemini_read(image, user_text, found, summary, gkey)
+
+    async def _pages_text(self, found) -> str:
+        """Fetch the top pages ourselves (the AstrBot model cannot open links)."""
+        pages = found["pages"][:4]
+        if not pages:
+            return ""
+        results = await asyncio.gather(
+            *[asyncio.wait_for(asyncio.to_thread(_fetch_page, p["url"]), timeout=PAGE_TIMEOUT + 7) for p in pages],
+            return_exceptions=True,
+        )
+        out = []
+        for i, (p, res) in enumerate(zip(pages, results), 1):
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            head = f"【网页{i}】{p['title']}\n{p['url']}"
+            if isinstance(res, BaseException):
+                reason = str(res) if isinstance(res, ValueError) else ("超时" if isinstance(res, asyncio.TimeoutError) else type(res).__name__)
+                self._dbg(f"网页{i} 读取失败：{reason} {p['url']}")
+                out.append(head + f"\n（读取失败：{reason}）")
+                continue
+            self._dbg(f"网页{i} 读取成功：{res['title']} | {_clip(res['desc'], 60)}")
+            out.append(head + "".join(f"\n{k}：{v}" for k, v in (("页面标题", res["title"]), ("描述", res["desc"]), ("正文摘录", res["body"])) if v))
+        return _clip("\n\n".join(out), PAGES_TEXT_CHARS)
+
+    async def _astrbot_read(self, image, user_text, found, summary) -> str:
+        pid = (self._c("reader_provider") or "").strip()
+        pages = await self._pages_text(found)
+        ask = (
+            (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
+            + "以图搜图找到的信息：\n" + summary
+            + (f"\n\n网页内容（由插件抓取）：\n{pages}" if pages else "")
+            + "\n\n请判断图中是哪部作品的哪个角色。"
+        )
+        img = "base64://" + base64.b64encode(image).decode("ascii")
+        try:
+            resp = await asyncio.wait_for(
+                self.context.llm_generate(chat_provider_id=pid, prompt=ask, system_prompt=DEFAULT_GEMINI_PROMPT, image_urls=[img]),
+                timeout=GEMINI_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise
+        except Exception as e:  # the model may not accept images: judge from the text alone
+            logger.warning(f"[vision_memory] 所选提供商不接受图片或调用失败（{type(e).__name__}），改为只用文字重试")
+            resp = await asyncio.wait_for(
+                self.context.llm_generate(chat_provider_id=pid, prompt=ask, system_prompt=DEFAULT_GEMINI_PROMPT),
+                timeout=GEMINI_TIMEOUT,
+            )
+        text = (getattr(resp, "completion_text", "") or "").strip()
+        self._dbg(f"AstrBot 提供商 {pid}: 输出: {_clip(text, 600)}")
+        return _clip(text, 600) if text else ""
 
     async def _gemini_read(self, image, user_text, found, summary, key) -> str:
         ask = (
