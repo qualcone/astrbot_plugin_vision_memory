@@ -1,5 +1,15 @@
 # 更新日志
 
+## v0.14.0
+
+- 联网大模型新增接口格式 **`dashscope`（阿里云百炼原生多模态接口）**：这是官方文档给出的“图片加联网搜索”的调用路径（多模态模型必须走多模态接口且联网搜索必须流式）。图片以 base64 数据链接放进 `input.messages`，额外参数放进 `parameters`，`"stream": true` 自动改为流式（`X-DashScope-SSE` + `incremental_output`），并读取其中的思考和正文。
+- 重新核对了千问官方联网搜索文档，更新 README 的千问配置：各模型支持的搜索策略（qwen3.8-flash 仅 turbo/max，omni 仅 agent）、Responses 格式的限制、文档没有图片加联网搜索的 Chat Completions 示例等。撤回了此前建议的 `thinking_budget`（文档说明 Responses 不支持，Chat 没有记载）。
+- 联网大模型返回未被执行的工具调用时，提示改为建议使用 `dashscope` 或 `responses` 格式。
+
+## v0.13.2
+
+- 联网大模型返回的是一段没有被执行的工具调用（`<tool_call>` / `<function=…>`，例如千问关闭思考后搜索没在服务端执行）时，不再当作识别结果，而是在日志和 `/vmtest` 里明确报错，并给出可尝试的办法。
+
 ## v0.13.1
 
 - 文档：通义千问示例加上 `"enable_thinking": false`。实测 qwen3.8-flash 默认开着思考，一次识图约 6600 个输出 token 里有 6400 个是思考，导致超时又多花钱。

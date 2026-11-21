@@ -49,7 +49,7 @@ PAGE_BODY_CHARS = 600
 PAGES_TEXT_CHARS = 3500
 VERIFY_TIMEOUT = 180  # default total seconds for the vendor model (settable)
 VERIFY_TIMEOUT_MIN = 30
-VERIFY_STYLES = ("chat", "responses")
+VERIFY_STYLES = ("chat", "responses", "dashscope")
 IMAGE_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
 GEMINI_TIMEOUT = 90
 CACHE_TTL = 3600  # seconds a finished identification is reused for the same image
@@ -502,6 +502,21 @@ def _sse_text(resp, style: str, progress=None) -> str:
         pr["last"] = now
         if isinstance(ev.get("error"), dict):
             raise ModelApiError(f"{_clip(ev['error'].get('message', ''), 150)}")
+        if style == "dashscope":
+            if ev.get("code") and not ev.get("output"):
+                raise ModelApiError(_clip(str(ev.get("message") or ev.get("code")), 150))
+            for ch in (ev.get("output") or {}).get("choices") or []:
+                msg = (ch.get("message") or {}) if isinstance(ch, dict) else {}
+                c = msg.get("content")
+                if isinstance(c, list):
+                    c = "".join(p.get("text", "") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+                if isinstance(c, str) and c:
+                    parts.append(c)
+                rc = msg.get("reasoning_content")
+                if isinstance(rc, str):
+                    pr["reasoning"] = pr.get("reasoning", 0) + len(rc)
+            pr["text"] = "".join(parts)
+            continue
         if style == "responses":
             if ev.get("type") == "response.output_text.delta" and isinstance(ev.get("delta"), str):
                 parts.append(ev["delta"])
@@ -536,6 +551,14 @@ def _json_text(data, style: str) -> str:
         return ""
     if isinstance(data.get("error"), dict):
         raise ModelApiError(_clip(data["error"].get("message", ""), 150) or "接口返回错误")
+    if style == "dashscope":
+        if data.get("code") and not data.get("output"):
+            raise ModelApiError(_clip(str(data.get("message") or data.get("code")), 150))
+        ch = ((data.get("output") or {}).get("choices") or [{}])[0]
+        content = (ch.get("message") or {}).get("content") if isinstance(ch, dict) else None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+        return content.strip() if isinstance(content, str) else ""
     if style == "responses":
         if isinstance(data.get("output_text"), str) and data["output_text"].strip():
             return data["output_text"].strip()
@@ -557,34 +580,52 @@ def _model_request(style, base, key, model, system, ask, image, extra, timeout, 
     """Blocking call to a vendor model API that has web search built in (the search
     is switched on through `extra`, e.g. {"enable_search": true}). The key goes only
     into the Authorization header of this request; redirects are not followed.
-    style "chat": POST {base}/chat/completions; style "responses": POST {base}/responses."""
+    style "chat": POST {base}/chat/completions; style "responses": POST {base}/responses;
+    style "dashscope": Alibaba's native multimodal interface, POST
+    {base}/api/v1/services/aigc/multimodal-generation/generation (the documented route
+    for image input + web search; `extra` goes into "parameters", "stream" switches on
+    server-sent events)."""
     data_url = f"data:{_sniff_mime(image)};base64,{base64.b64encode(image).decode('ascii')}"
     base = base.rstrip("/")
-    if style == "responses":
-        url = base if base.endswith("/responses") else base + "/responses"
-        body = {"model": model, "input": [{"role": "user", "content": [{"type": "input_text", "text": ask}, {"type": "input_image", "image_url": data_url}]}]}
-        if system:
-            body["instructions"] = system
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json; charset=utf-8"}
+    stream = False
+    if style == "dashscope":
+        url = base if base.endswith("/generation") else base + "/api/v1/services/aigc/multimodal-generation/generation"
+        params = {"result_format": "message"}
+        for k, v in (extra or {}).items():
+            if k == "stream":
+                stream = v is True
+            elif k not in ("model", "input"):
+                params[k] = v
+        if stream:
+            params["incremental_output"] = True
+            headers["X-DashScope-SSE"] = "enable"
+        body = {
+            "model": model,
+            "input": {"messages": [
+                {"role": "system", "content": [{"text": system}]},
+                {"role": "user", "content": [{"image": data_url}, {"text": ask}]},
+            ]},
+            "parameters": params,
+        }
     else:
-        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
-        body = {"model": model, "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {"url": data_url}}]},
-        ]}
-    for k, v in (extra or {}).items():
-        if k not in ("model", "messages", "input"):
-            body[k] = v
-    stream = body.get("stream") is True
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "text/event-stream" if stream else "application/json",
-        },
-    )
+        if style == "responses":
+            url = base if base.endswith("/responses") else base + "/responses"
+            body = {"model": model, "input": [{"role": "user", "content": [{"type": "input_text", "text": ask}, {"type": "input_image", "image_url": data_url}]}]}
+            if system:
+                body["instructions"] = system
+        else:
+            url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+            body = {"model": model, "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {"url": data_url}}]},
+            ]}
+        for k, v in (extra or {}).items():
+            if k not in ("model", "messages", "input"):
+                body[k] = v
+        stream = body.get("stream") is True
+    headers["Accept"] = "text/event-stream" if stream else "application/json"
+    req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), method="POST", headers=headers)
     try:
         with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as r:
             if stream or r.headers.get_content_type() == "text/event-stream":
@@ -592,8 +633,9 @@ def _model_request(style, base, key, model, system, ask, image, extra, timeout, 
             data = json.loads(r.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
         try:
-            err = json.loads(e.read().decode("utf-8") or "{}").get("error")
-            msg = err.get("message", "") if isinstance(err, dict) else str(err or "")
+            j = json.loads(e.read().decode("utf-8") or "{}")
+            err = j.get("error")
+            msg = err.get("message", "") if isinstance(err, dict) else str(err or j.get("message") or "")
         except Exception:
             msg = ""
         raise ModelApiError(f"HTTP {e.code} {_clip(msg, 150)}".strip())
@@ -1024,6 +1066,13 @@ class VisionMemory(Star):
             logger.warning(f"[vision_memory] 联网大模型调用失败：{type(e).__name__}")
             return "", type(e).__name__
         self._dbg(f"联网大模型（{style}）输出: {_clip(text, 600)}")
+        if "<tool_call>" in text or "<function=" in text:
+            note = (
+                "模型返回的是一段没有被执行的工具调用（联网搜索没有在服务端执行），不是识别结果。"
+                "通义千问图片加联网搜索建议把“接口格式”改成“DashScope 原生多模态”，或改用 responses 格式"
+            )
+            logger.warning(f"[vision_memory] 联网大模型：{note}")
+            return "", note
         return text, ""
 
     @staticmethod
