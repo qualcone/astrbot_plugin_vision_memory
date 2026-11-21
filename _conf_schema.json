@@ -75,7 +75,7 @@
         "description": "额外请求参数（JSON）",
         "type": "text",
         "default": "",
-        "hint": "用来打开该厂商的联网搜索，原样合并进请求体（dashscope 格式合并进 parameters）。通义千问（推荐 dashscope 格式，多模态联网搜索必须流式）：{\"enable_search\": true, \"search_options\": {\"search_strategy\": \"max\", \"forced_search\": true}, \"stream\": true}；responses 格式：{\"tools\": [{\"type\": \"web_search\"}]}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}。具体写法请以厂商文档为准。"
+        "hint": "用来打开该厂商的联网搜索，原样合并进请求体（dashscope 格式合并进 parameters）。通义千问（推荐 dashscope 格式，多模态联网搜索必须流式）：{\"enable_search\": true, \"search_options\": {\"search_strategy\": \"max\", \"forced_search\": true}, \"stream\": true}；responses 格式：{\"tools\": [{\"type\": \"web_search\"}]}；DeepSeek（接口格式 chat，地址 https://api.deepseek.com，模型 deepseek-flash，关闭思考）：{\"tools\": [{\"type\": \"deepseek_web_search\"}], \"thinking\": {\"type\": \"disabled\"}}；智谱：{\"tools\": [{\"type\": \"web_search\", \"web_search\": {\"enable\": true}}]}。具体写法请以厂商文档为准。"
       },
       "verify_timeout": {
         "description": "超时（秒）",
@@ -101,14 +101,16 @@
         "type": "string",
         "options": [
           "gemini",
-          "astrbot"
+          "astrbot",
+          "deepseek"
         ],
         "labels": [
           "Gemini 直连（推荐）",
-          "AstrBot 里的模型"
+          "AstrBot 里的模型",
+          "DeepSeek 直连（推理）"
         ],
         "default": "gemini",
-        "hint": "Gemini 直连：插件直接请求 Gemini，由 Gemini 自己打开网页，认出作品后还会联网搜索角色列表来匹配角色。AstrBot 里的模型：用下面选的提供商，网页由插件抓取文字后交给它，不做“匹配角色”这一步；该模型最好支持图片输入，不支持会自动只用文字判断。"
+        "hint": "Gemini 直连：插件直接请求 Gemini，由 Gemini 自己打开网页，认出作品后还会联网搜索角色列表来匹配角色。AstrBot 里的模型：用选的提供商，网页由插件抓取文字后交给它，不做“匹配角色”这一步。DeepSeek 直连：插件直接请求 DeepSeek（deepseek-flash，开启思考），网页由插件抓取文字（每页摘录更长），模型按“特征向量 → 候选生成 → 约束筛选 → 知识核对”推理；不做联网搜索；总时限不会低于 150 秒。"
       },
       "reader_provider": {
         "description": "AstrBot 提供商",
@@ -141,6 +143,49 @@
         "type": "string",
         "default": "",
         "hint": "仅“Gemini 直连”方式使用。访问 Gemini 需要代理时填写，如 http://127.0.0.1:7890。留空则使用系统环境变量中的代理（如有）。"
+      },
+      "ds_api_key": {
+        "description": "DeepSeek API Key",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "仅“DeepSeek 直连”方式使用。只保存在本插件配置中，不写入日志。"
+      },
+      "ds_model": {
+        "description": "DeepSeek 模型",
+        "type": "string",
+        "default": "deepseek-flash",
+        "hint": "仅“DeepSeek 直连”方式使用。官方文档当前的模型是 deepseek-flash（支持图片输入）和 deepseek-v4-pro（仅文字）；deepseek-chat、deepseek-reasoner 官方已计划停用，不要再用。"
+      },
+      "ds_base_url": {
+        "description": "DeepSeek 接口地址",
+        "type": "string",
+        "default": "https://api.deepseek.com",
+        "hint": "官方地址一般不用改，不要带 /chat/completions。Key 会发往此地址，请只填可信地址。"
+      },
+      "ds_extra": {
+        "description": "DeepSeek 额外请求参数（JSON）",
+        "type": "text",
+        "default": "{\"thinking\": {\"type\": \"enabled\"}}",
+        "hint": "原样合并进请求体（不能覆盖 model、messages）。默认明确开启思考（推理）。注意：思考也算在输出里，官方思考模式默认输出上限是 64K，所以默认不设 max_tokens，设小了会把答案截断。思考模式下 temperature 等采样参数无效。"
+      },
+      "ds_timeout": {
+        "description": "DeepSeek 超时（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "等待回答的总时长（30–600）。推理模型思考可能要一两分钟。"
+      },
+      "ds_send_image": {
+        "description": "把图片一起发给 DeepSeek",
+        "type": "bool",
+        "default": true,
+        "hint": "开启时先带图片请求；如果这个模型不接受图片（返回 4xx），自动改成只用文字重试，并且之后不再带图片。关闭则始终只用文字（Google 的线索和网页摘录）。"
+      },
+      "ds_prompt": {
+        "description": "DeepSeek 提示词",
+        "type": "text",
+        "default": "你是动漫和 Galgame 角色识别专家，要识别图中的主要对象。信息来源：以图搜图找到的网页标题、实体和网页内容摘录（可能夹杂无关页面），以及图片本身（如果提供了）。按下面的流程在思考里推理，最后只输出四行结果。\n1. 特征向量：有图就先提取强特征（发型发色、瞳色眼型、服装、配饰道具、画风、画面文字）；没有图就用网页里的描述。金发、蓝眼这类常见特征只算弱特征。\n2. 候选生成：从以图搜图的实体和网页标题里挑出候选，用强特征的组合缩小范围；先判断网页是不是真的在讲这张图里的角色，过滤掉无关页面。\n3. 约束筛选：用网页摘录里的设定和你记得的设定交叉验证（人设、职业、口癖、标志性道具、剧情元素、声优、会社、发售年份），排除不符合的候选；吻合的和不吻合的特征都要记下。\n4. 知识核对：至少 2～3 个强特征吻合，再加 1 个设定线索，才给高置信度；只有 1 个吻合最多给低；有明显不吻合要降低置信度或换候选。同人图、换装、画师风格会让特征偏移；冷门或原创角色主动标低置信度。\n“设定”只写网页摘录里读到的内容，读不到写“未读到”，不要凭记忆补充；记不清就说记不清，不要编造。每项写成一行，不要换行。输出四行：\n对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认出了出处但认不准是谁写“未确定”；完全没有线索写“无法确认”\n出处：作品名，或真人的身份；不知道写“未知”\n设定：外貌与人设要点（发色发型、瞳色、肤色、服饰、身份、标志性特征）；读不到写“未读到”\n依据：吻合的强特征、不吻合的特征、信息来自哪个网页或线索",
+        "hint": "发给 DeepSeek 的指令，可修改，清空用内置默认。建议保留末尾“对象 / 出处 / 设定 / 依据”四行格式。"
       }
     }
   },

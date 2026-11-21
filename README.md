@@ -50,8 +50,9 @@
 | | 额外请求参数（JSON） | 用来打开该厂商的联网搜索，原样合并进请求体。 |
 | | 超时（秒） | 等待回答的总时长，默认 180。超时时会写出超时前收到了多少数据。 |
 | | 核实提示词 | 发给该模型的指令，可修改，清空用内置默认。 |
-| ② 第二步：读取网页并判断 | 读取网页的方式 | `Gemini 直连`（推荐）或 `AstrBot 里的模型`，见下文。 |
+| ② 第二步：读取网页并判断 | 读取网页的方式 | `Gemini 直连`（推荐）、`AstrBot 里的模型` 或 `DeepSeek 直连（推理）`，见下文。 |
 | | AstrBot 提供商 | 仅“AstrBot 里的模型”方式使用，选一个已配置的对话模型。 |
+| | DeepSeek API Key / 模型 / 接口地址 / 额外参数 / 超时 / 是否带图 / 提示词 | 仅 DeepSeek 方式使用。默认模型 `deepseek-flash`、地址 `https://api.deepseek.com`、额外参数 `{"thinking": {"type": "enabled"}}`、超时 180 秒、带图（不接受时自动退回纯文字）。 |
 | | Gemini API Key / 模型 / 接口地址 / 网络代理 | 仅 Gemini 方式使用。Key 在 Google AI Studio 创建；模型需支持图片输入和读取网页（URL Context），默认 `gemini-3.5-flash`。 |
 | ③ 第三步：联网搜索资料 | 联网搜索资料（开关，默认开） | 认出对象后再联网搜索它的外貌设定和人设；仅 Gemini 直连方式支持。关闭则只用第二步读到的信息。 |
 | | 搜索资料的提示词 | 发给 Gemini 的指令，可修改，清空用内置默认。 |
@@ -63,10 +64,13 @@
 
 ### 第二步用哪个模型
 
+> 选 DeepSeek 时，**识别总时限不会低于 150 秒**（推理模型思考可能要一两分钟，默认 60 秒会把它切掉）。
+
 | 方式 | 谁读网页 | 能力 |
 | --- | --- | --- |
 | Gemini 直连（推荐） | Gemini 自己打开网页（URL Context） | 认出作品但认不准角色时，会再联网搜索这部作品的角色列表，按外貌匹配出角色 |
 | AstrBot 里的模型 | 插件抓取网页文字（标题、描述、正文摘录）后交给你选的模型 | 不做第 3 步（联网搜索资料、匹配角色）；模型不支持图片输入时自动只用文字判断 |
+| DeepSeek 直连（推理） | 插件抓取网页文字（每页摘录 1500 字，比上一种更长）后交给 DeepSeek 推理模型 | 按“特征向量 → 候选生成 → 约束筛选 → 知识核对”推理；不做第 3 步；默认带图请求，模型不接受图片时自动改为纯文字并记住 |
 
 插件抓取网页时只访问公网地址：拒绝本机、内网和链路本地地址（重定向的目标同样检查），限制页面大小和超时，不携带任何凭据。需要登录或仅靠 JS 渲染的网站读不到内容，会在给模型的文字里标明“读取失败”。
 
@@ -95,10 +99,20 @@ Google 的网页匹配对一部分二次元角色搜不到。B 来源调一个**
 
 | 厂商 | 接口格式 | 接口地址 | 额外请求参数示例 |
 | --- | --- | --- | --- |
+| DeepSeek（备选） | `chat` | `https://api.deepseek.com` | 模型 `deepseek-flash`；`{"tools": [{"type": "deepseek_web_search"}], "thinking": {"type": "disabled"}}` |
 | 通义千问（百炼）**推荐** | `dashscope` | `https://dashscope.aliyuncs.com` | `{"enable_search": true, "search_options": {"search_strategy": "max", "forced_search": true}, "stream": true}` |
 | 通义千问（备选） | `responses` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `{"tools": [{"type": "web_search"}]}` |
 | 智谱 GLM | `chat` | 厂商文档 | `{"tools": [{"type": "web_search", "web_search": {"enable": true}}]}` |
 | OpenAI / 豆包（方舟） | `responses` | 厂商文档 | `{"tools": [{"type": "web_search"}]}` |
+
+**DeepSeek 联网搜索怎么配**（依据 DeepSeek 官方 API 文档的 web_tools 页面，我核对过，列在这里的都是文档写明的）：
+
+- 模型用 **`deepseek-flash`**：支持图片输入，文档说明带图时模型可以做图片搜索。`deepseek-v4-pro` 只支持文字。旧名字 `deepseek-chat`、`deepseek-reasoner` 官方已计划停用（2026-07-24），不要再用。
+- 在 `tools` 里声明 `{"type": "deepseek_web_search"}`（Chat Completions 格式不需要 `name` 字段）；只想读消息里的链接、不主动搜索，用 `{"type": "deepseek_read_url"}`（只检查最后一条用户消息里的链接，最多前 10 个）。
+- **思考默认是开着的**：`thinking` 不写、`reasoning_effort` 也不写时，思考是开启的，联网会变成“深度思考搜索”（最多约 20 次工具调用，很慢）。要普通联网搜索必须明确写 `"thinking": {"type": "disabled"}`。
+- **不能**把 `tool_choice` 指定成这两个工具（返回 400），是否搜索由模型自己判断；联网工具**不能和普通函数工具混用**；`web_search_options` 会返回 400。
+- 计费：官方定价页写明 2026-11-18 起，模型触发的服务端搜索和网页抓取**不再单独计费**，只算 token（deepseek-flash 输入 $0.15 / 百万、输出 $0.6 / 百万，高峰时段翻倍；以官方页面为准）。
+- 不要求流式；回答里的引用在 `message.annotations`，插件只读取最终文字。
 
 **通义千问（百炼）怎么配**（依据官方联网搜索文档 help.aliyun.com/zh/model-studio/web-search 和 Responses 兼容文档）：
 

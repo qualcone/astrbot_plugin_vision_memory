@@ -42,11 +42,21 @@ WRITE_TIMEOUT = 85  # seconds; LivingMemory's own request limit is 90s
 PERSONA_NONE = "[%None]"
 
 MAX_IMAGES = 3  # images identified per message
-READERS = ("gemini", "astrbot")
+READERS = ("gemini", "astrbot", "deepseek")
 PAGE_TIMEOUT = 8  # seconds per page when the plugin fetches pages itself
 PAGE_MAX_BYTES = 300_000
 PAGE_BODY_CHARS = 600
 PAGES_TEXT_CHARS = 3500
+# DeepSeek reader: a reasoning model reads far more text than the AstrBot-model reader, and
+# thinks for a long time, so the page excerpts are longer and the time limits are generous.
+DS_DEFAULT_BASE = "https://api.deepseek.com"
+# Thinking is explicit (the reasoning procedure is the point of this reader). max_tokens is left out on purpose:
+# thinking counts as output and the API's own default for thinking mode is 64K, a small value would cut the answer.
+DS_DEFAULT_EXTRA = '{"thinking": {"type": "enabled"}}'
+DS_PAGE_BODY_CHARS = 1500
+DS_PAGES_TEXT_CHARS = 8000
+DS_TIMEOUT = 180
+DS_MIN_TOTAL = 150  # the whole-identification limit is never lower than this with this reader
 VERIFY_TIMEOUT = 180  # default total seconds for the vendor model (settable)
 VERIFY_TIMEOUT_MIN = 30
 VERIFY_STYLES = ("chat", "responses", "dashscope")
@@ -70,6 +80,13 @@ GROUP_OF = {
     "reverse_proxy": "reverse",
     "reader": "gemini",
     "reader_provider": "gemini",
+    "ds_api_key": "gemini",
+    "ds_model": "gemini",
+    "ds_base_url": "gemini",
+    "ds_extra": "gemini",
+    "ds_timeout": "gemini",
+    "ds_send_image": "gemini",
+    "ds_prompt": "gemini",
     "total_timeout": "speed",
     "cache_days": "speed",
     "verify_enable": "verify",
@@ -129,6 +146,18 @@ DEFAULT_VERIFY_PROMPT = "\n".join([
 # defaults shipped by earlier versions: a saved copy of one of these is replaced by the current default
 OLD_PROFILE_DEFAULTS = ('你是识图助手，任务是联网搜索核实并补充资料。已知线索会在问题里给出（对象、出处）。\n1. 对象已知：搜索它的基本资料（萌娘百科、维基、官方站等），重点是外貌设定（发色发型、瞳色、肤色、服饰、标志性特征）、身份和人设要点，并对照图片核对是否一致。\n2. 对象未确定但出处已知：先搜索这部作品的角色列表，按图中人物的外貌逐个比对，找出最像的。\n只写搜索结果里出现的内容，不要凭记忆补充，不要编造；资料冲突时以萌娘百科、官方资料为准。输出四行：\n对象：名字（类型，可信度 高/中/低）；认不出写“未确定”\n设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n其他可能：难分的其他候选，没有就写“无”\n依据：来源',)
 OLD_VERIFY_DEFAULTS = ('你是识图助手，任务是用你的联网搜索能力核实图中对象是谁。问题里会给出已知线索（可能有误，也可能为空，仅供参考）。\n请联网查证图中对象的名字、出处和外貌设定（发色发型、瞳色、肤色、服饰、标志性特征、人设要点），并对照图片核对。与已知线索冲突时，以你搜索到的可靠资料（萌娘百科、维基、官方站）为准，并在依据里说明分歧。\n只写搜索结果里出现的内容，不要凭记忆补充，不要编造。输出四行：\n对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认不出写“未确定”\n出处：作品名，或真人的身份；不知道写“未知”\n设定：外貌与人设要点，不超过 120 字；没搜到写“未读到”\n依据：来源',)
+DEFAULT_DS_PROMPT = "\n".join([
+    "你是动漫和 Galgame 角色识别专家，要识别图中的主要对象。信息来源：以图搜图找到的网页标题、实体和网页内容摘录（可能夹杂无关页面），以及图片本身（如果提供了）。按下面的流程在思考里推理，最后只输出四行结果。",
+    "1. 特征向量：有图就先提取强特征（发型发色、瞳色眼型、服装、配饰道具、画风、画面文字）；没有图就用网页里的描述。金发、蓝眼这类常见特征只算弱特征。",
+    "2. 候选生成：从以图搜图的实体和网页标题里挑出候选，用强特征的组合缩小范围；先判断网页是不是真的在讲这张图里的角色，过滤掉无关页面。",
+    "3. 约束筛选：用网页摘录里的设定和你记得的设定交叉验证（人设、职业、口癖、标志性道具、剧情元素、声优、会社、发售年份），排除不符合的候选；吻合的和不吻合的特征都要记下。",
+    "4. 知识核对：至少 2～3 个强特征吻合，再加 1 个设定线索，才给高置信度；只有 1 个吻合最多给低；有明显不吻合要降低置信度或换候选。同人图、换装、画师风格会让特征偏移；冷门或原创角色主动标低置信度。",
+    "“设定”只写网页摘录里读到的内容，读不到写“未读到”，不要凭记忆补充；记不清就说记不清，不要编造。每项写成一行，不要换行。输出四行：",
+    "对象：名字（类型：动漫角色/游戏角色/真人/表情包/其他，可信度 高/中/低）；认出了出处但认不准是谁写“未确定”；完全没有线索写“无法确认”",
+    "出处：作品名，或真人的身份；不知道写“未知”",
+    "设定：外貌与人设要点（发色发型、瞳色、肤色、服饰、身份、标志性特征）；读不到写“未读到”",
+    "依据：吻合的强特征、不吻合的特征、信息来自哪个网页或线索",
+])
 DEFAULT_GUIDANCE = (
     '图片识别结论里的“设定”是联网查到的资料，描述外貌和人设时以它为准，不要凭印象补充。可信度高可直接采用；中或低请向用户说明不太确定；写着“无法确认”时如实告知，不要编造。核实无误后调用 save_character_memory 保存，下次可直接召回。'
 )
@@ -427,7 +456,7 @@ class _PageText(HTMLParser):
         return " ".join(self._body)
 
 
-def _fetch_page(url: str) -> dict:
+def _fetch_page(url: str, body_chars: int = PAGE_BODY_CHARS) -> dict:
     """Blocking. Fetch one public web page and extract title / description / text.
     Raises ValueError with a short reason. Never sends any credential."""
     u = urlparse(url)
@@ -463,7 +492,7 @@ def _fetch_page(url: str) -> dict:
         p.feed(html)
     except Exception:
         pass
-    return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, PAGE_BODY_CHARS)}
+    return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, body_chars)}
 
 
 def _dhash(image: bytes):
@@ -619,7 +648,7 @@ def _model_request(style, base, key, model, system, ask, image, extra, timeout, 
     {base}/api/v1/services/aigc/multimodal-generation/generation (the documented route
     for image input + web search; `extra` goes into "parameters", "stream" switches on
     server-sent events)."""
-    data_url = f"data:{_sniff_mime(image)};base64,{base64.b64encode(image).decode('ascii')}"
+    data_url = f"data:{_sniff_mime(image)};base64,{base64.b64encode(image).decode('ascii')}" if image is not None else ""
     base = base.rstrip("/")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json; charset=utf-8"}
     stream = False
@@ -650,9 +679,10 @@ def _model_request(style, base, key, model, system, ask, image, extra, timeout, 
                 body["instructions"] = system
         else:
             url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+            user = [{"type": "text", "text": ask}] + ([{"type": "image_url", "image_url": {"url": data_url}}] if image is not None else [])
             body = {"model": model, "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {"url": data_url}}]},
+                {"role": "user", "content": user if image is not None else ask},
             ]}
         for k, v in (extra or {}).items():
             if k not in ("model", "messages", "input"):
@@ -718,6 +748,7 @@ class VisionMemory(Star):
         self._warned = set()
         self._cache = {}
         self._cache_loaded = False
+        self._ds_no_image = False
         self._log_status()
 
     # ---- config / logging ----
@@ -735,6 +766,8 @@ class VisionMemory(Star):
     def _reader_ready(self) -> bool:
         if self._reader() == "astrbot":
             return bool((self._c("reader_provider") or "").strip())
+        if self._reader() == "deepseek":
+            return bool((self._c("ds_api_key") or "").strip() and (self._c("ds_model") or "").strip())
         return bool((self._c("gemini_api_key") or "").strip())
 
     def _gv_on(self) -> bool:
@@ -769,7 +802,7 @@ class VisionMemory(Star):
     def _cache_sig(self) -> str:
         """Fingerprint of the settings that shape a result: a changed setting invalidates old entries."""
         parts = [
-            self._reader(), (self._c("reader_provider") or ""), (self._c("gemini_model") or ""),
+            self._reader(), (self._c("reader_provider") or ""), (self._c("gemini_model") or ""), (self._c("ds_model") or ""),
             str(bool(self._c("profile_search", True))), str(self._gv_on()),
             str(self._verify_on()), ((self._c("verify_model") or "") if self._verify_on() else ""),
         ]
@@ -842,7 +875,12 @@ class VisionMemory(Star):
         try:
             has = lambda k: "已填" if (self._c(k) or "").strip() else "未填"
             reader = self._reader()
-            who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}" if reader == "astrbot" else f"Gemini 密钥={has('gemini_api_key')}"
+            if reader == "astrbot":
+                who = f"AstrBot 提供商={(self._c('reader_provider') or '').strip() or '(未选择)'}"
+            elif reader == "deepseek":
+                who = f"DeepSeek 密钥={has('ds_api_key')}，模型={(self._c('ds_model') or '').strip() or '(未填)'}"
+            else:
+                who = f"Gemini 密钥={has('gemini_api_key')}"
             if not self._c("gv_enable", True):
                 gv = "关"
             elif not (self._c("gv_api_key") or "").strip():
@@ -867,7 +905,7 @@ class VisionMemory(Star):
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
 
     def _missing_msg(self) -> str:
-        second = "第二步选择的 AstrBot 提供商" if self._reader() == "astrbot" else "第二步的 Gemini 密钥"
+        second = {"astrbot": "第二步选择的 AstrBot 提供商", "deepseek": "第二步的 DeepSeek 密钥和模型"}.get(self._reader(), "第二步的 Gemini 密钥")
         return (
             "[vision_memory] 图片识别需要至少启用并配好一个第一步来源：A. Google 以图搜图（填 Google Vision 密钥，"
             f"并配好{second}来读取网页），或 B. 联网大模型（填接口地址、Key、模型）。否则图片会原样传给主模型。"
@@ -995,6 +1033,8 @@ class VisionMemory(Star):
         )
 
         total = _as_int(self._c("total_timeout", TOTAL_TIMEOUT), TOTAL_TIMEOUT, TOTAL_TIMEOUT_MIN, 600)
+        if self._reader() == "deepseek":
+            total = max(total, DS_MIN_TOTAL)  # a reasoning model cannot finish in the default 60s
         deadline = t_start + total
 
         # step 1: two independent, optional sources run at the same time:
@@ -1328,15 +1368,17 @@ class VisionMemory(Star):
         """Step 2: the chosen model reads the pages and says which work / character."""
         if self._reader() == "astrbot":
             return await self._astrbot_read(image, user_text, found, summary)
+        if self._reader() == "deepseek":
+            return await self._deepseek_read(image, user_text, found, summary)
         return await self._gemini_read(image, user_text, found, summary, gkey)
 
-    async def _pages_text(self, found) -> str:
+    async def _pages_text(self, found, body_chars: int = PAGE_BODY_CHARS, total: int = PAGES_TEXT_CHARS) -> str:
         """Fetch the top pages ourselves (the AstrBot model cannot open links)."""
         pages = found["pages"][:4]
         if not pages:
             return ""
         results = await asyncio.gather(
-            *[asyncio.wait_for(asyncio.to_thread(_fetch_page, p["url"]), timeout=PAGE_TIMEOUT + 7) for p in pages],
+            *[asyncio.wait_for(asyncio.to_thread(_fetch_page, p["url"], body_chars), timeout=PAGE_TIMEOUT + 7) for p in pages],
             return_exceptions=True,
         )
         out = []
@@ -1351,7 +1393,58 @@ class VisionMemory(Star):
                 continue
             self._dbg(f"网页{i} 读取成功：{res['title']} | {_clip(res['desc'], 60)}")
             out.append(head + "".join(f"\n{k}：{v}" for k, v in (("页面标题", res["title"]), ("描述", res["desc"]), ("正文摘录", res["body"])) if v))
-        return _clip("\n\n".join(out), PAGES_TEXT_CHARS)
+        return _clip("\n\n".join(out), total)
+
+    def _ds_extra(self) -> dict:
+        raw = (self._c("ds_extra", DS_DEFAULT_EXTRA) or "").strip()
+        if not raw:
+            return {}
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                return d
+        except ValueError:
+            pass
+        self._warn_once("ds_extra", "[vision_memory] DeepSeek 的“额外请求参数”不是有效的 JSON 对象，已忽略。")
+        return {}
+
+    async def _deepseek_read(self, image, user_text, found, summary) -> str:
+        """Step 2 with DeepSeek's own API: the plugin fetches the pages (the model cannot open
+        links), the reasoning model reads them together with Google's clues (and the image, when
+        the model accepts images) and answers in the usual four lines."""
+        base = (self._c("ds_base_url") or DS_DEFAULT_BASE).strip()
+        if urlparse(base).scheme not in ("http", "https"):
+            raise ModelApiError("DeepSeek 接口地址必须以 http:// 或 https:// 开头")
+        key = (self._c("ds_api_key") or "").strip()
+        model = (self._c("ds_model") or "").strip()
+        system = (self._c("ds_prompt") or "").strip() or DEFAULT_DS_PROMPT
+        timeout = _as_int(self._c("ds_timeout", DS_TIMEOUT), DS_TIMEOUT, 30, 600)
+        pages = await self._pages_text(found, DS_PAGE_BODY_CHARS, DS_PAGES_TEXT_CHARS)
+        ask = (
+            (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
+            + "以图搜图找到的信息：\n" + summary
+            + (f"\n\n网页内容（由插件抓取）：\n{pages}" if pages else "")
+            + "\n\n请判断图中是哪部作品的哪个角色。"
+        )
+        extra = self._ds_extra()
+
+        async def call(img):
+            return await asyncio.wait_for(
+                asyncio.to_thread(_model_request, "chat", base, key, model, system, ask, img, extra, timeout), timeout=timeout
+            )
+
+        send_image = bool(self._c("ds_send_image", True)) and not self._ds_no_image
+        try:
+            text = await call(image if send_image else None)
+        except ModelApiError as e:
+            if not (send_image and "HTTP 4" in str(e)):
+                raise
+            logger.warning(f"[vision_memory] DeepSeek 不接受图片（{e}），改为只用文字；之后的识别不再带图片")
+            self._ds_no_image = True
+            text = await call(None)
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+        self._dbg(f"DeepSeek（{model}，{'带图' if send_image and not self._ds_no_image else '纯文字'}）输出: {_clip(text, 600)}")
+        return _clip(text, 600) if text else ""
 
     async def _astrbot_read(self, image, user_text, found, summary) -> str:
         pid = (self._c("reader_provider") or "").strip()
