@@ -72,6 +72,51 @@
       }
     }
   },
+  "reverse": {
+    "description": "以图搜图（可选）",
+    "type": "object",
+    "hint": "用图片本身去反查（不是文字搜索）。图片会被上传到所启用的服务，默认关闭。SauceNAO 和 trace.moe 擅长插画与动画截图，Google 网页匹配适用范围更广。",
+    "items": {
+      "reverse_enable": {
+        "description": "启用以图搜图",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，识图前先用图片反查，相似度达标的结果会交给识图模型参考，并原样附给主模型。图片会上传到下面启用的服务。"
+      },
+      "saucenao_api_key": {
+        "description": "SauceNAO API Key",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "在 saucenao.com 注册后获取（免费账号有次数限制）。留空则不用 SauceNAO。擅长插画、同人图、漫画。"
+      },
+      "gv_api_key": {
+        "description": "Google Cloud Vision API Key",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "Google 官方的网页匹配（Web Detection）：返回包含这张图的网页和网络实体，最接近 Google 识图。每月前 1000 次免费，之后约 3.5 美元/千次。留空则不用。Key 获取方法见 README。"
+      },
+      "use_tracemoe": {
+        "description": "使用 trace.moe",
+        "type": "bool",
+        "default": true,
+        "hint": "无需 Key，擅长动画截图（返回作品、集数、时间点）。"
+      },
+      "reverse_min_similarity": {
+        "description": "最低相似度（%）",
+        "type": "int",
+        "default": 80,
+        "hint": "低于此相似度的结果会被丢弃（50–99）。越高越严格，越不容易被误导。"
+      },
+      "reverse_proxy": {
+        "description": "网络代理（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "访问 SauceNAO / trace.moe 需要代理时填写，如 http://127.0.0.1:7890。"
+      }
+    }
+  },
   "memory": {
     "description": "长期记忆（LivingMemory）",
     "type": "object",

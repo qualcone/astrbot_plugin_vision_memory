@@ -43,11 +43,13 @@ DEFAULT_SEARCH_PROMPT = (
     "你是识图助手。你对角色的第一印象经常是错的，所以必须联网搜索，以搜索结果为准。\n"
     "先看图提取外貌特征和画面文字，用它们联网搜索（可先用 recall_long_term_memory 查记忆）；"
     "结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
+    "如果提供了以图搜图结果且相似度高，以它为准。\n"
     "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
 )
 DEFAULT_GEMINI_PROMPT = (
     "你是识图助手。你对角色的第一印象经常是错的，所以必须用 Google 搜索核实，以搜索结果为准。\n"
     "先看图提取外貌特征和画面文字，再搜索；结果对不上就换关键词再搜，仍对不上就写“无法确认”，不要编造。\n"
+    "如果提供了以图搜图结果且相似度高，以它为准。\n"
     "输出两行：\n识别结论：角色名 / 作品 / 依据\n画面描述：外貌、画风、画面文字，简短即可"
 )
 _FORCE_SEARCH = "你刚才没有调用联网搜索工具。请先用图中特征联网搜索，再按要求输出。"
@@ -127,6 +129,12 @@ GROUP_OF = {
     "gemini_model": "gemini",
     "gemini_base_url": "gemini",
     "gemini_proxy": "gemini",
+    "reverse_enable": "reverse",
+    "saucenao_api_key": "reverse",
+    "gv_api_key": "reverse",
+    "use_tracemoe": "reverse",
+    "reverse_min_similarity": "reverse",
+    "reverse_proxy": "reverse",
     "lm_api_url": "memory",
     "lm_api_key": "memory",
     "memory_scope": "memory",
@@ -280,6 +288,162 @@ def _gemini_request(base, model, key, proxy, system, ask, image, timeout):
         if isinstance(c, dict)
     ]
     return text, queries, [x for x in sources if x]
+
+
+SAUCENAO_URL = "https://saucenao.com/search.php"
+TRACEMOE_URL = "https://api.trace.moe/search?anilistInfo&cutBorders"
+VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
+VISION_MAX_BYTES = 7 * 1024 * 1024  # Vision API request limit is 10MB incl. base64
+
+
+class ReverseError(Exception):
+    pass
+
+
+def _opener(proxy: str):
+    handlers = [_NoRedirect()]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener(*handlers)
+
+
+def _post(opener, req, timeout, name):
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        hint = {403: "Key 无效或无权限", 429: "次数用完或被限流"}.get(e.code, "")
+        msg = ""
+        try:
+            err = json.loads(e.read().decode("utf-8") or "{}").get("error")
+            msg = err.get("message", "") if isinstance(err, dict) else ""
+        except Exception:
+            pass
+        raise ReverseError(f"{name} HTTP {e.code} {hint} {_clip(msg, 150)}".strip())
+    except ValueError:
+        raise ReverseError(f"{name} 返回内容不是有效的 JSON")
+
+
+def _s(v, limit=80) -> str:
+    if isinstance(v, (list, tuple)):
+        v = "、".join(str(x) for x in v if x)
+    return _clip(str(v).strip(), limit) if v else ""
+
+
+def _saucenao(key, image, proxy, timeout, min_sim):
+    """Blocking. Reverse image search on SauceNAO (the key is sent only as a
+    form field to the SauceNAO URL; redirects are not followed)."""
+    boundary = "----vm" + hashlib.md5(image[:256]).hexdigest()
+    fields = {"output_type": "2", "api_key": key, "db": "999", "numres": "6"}
+    body = b""
+    for k, v in fields.items():
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    body += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="img"\r\n'
+        f"Content-Type: {_sniff_mime(image)}\r\n\r\n"
+    ).encode() + image + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        SAUCENAO_URL, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    data = _post(_opener(proxy), req, timeout, "SauceNAO")
+    head = data.get("header") or {}
+    if head.get("status", 0) not in (0, None):
+        raise ReverseError(f"SauceNAO 返回错误 status={head.get('status')} {_s(head.get('message'), 80)}")
+    hits = []
+    for r in data.get("results") or []:
+        h, d = r.get("header") or {}, r.get("data") or {}
+        try:
+            sim = float(h.get("similarity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sim < min_sim:
+            continue
+        bits = []
+        title = d.get("title") or d.get("eng_name") or d.get("jp_name") or d.get("source")
+        for label, val in (
+            ("标题", title), ("角色", d.get("characters")), ("作品", d.get("material")),
+            ("作者", d.get("creator") or d.get("member_name") or d.get("author_name")),
+        ):
+            if _s(val):
+                bits.append(f"{label}：{_s(val)}")
+        urls = d.get("ext_urls") or []
+        if urls:
+            bits.append(f"链接：{_s(urls[0], 120)}")
+        if bits:
+            hits.append({"src": "SauceNAO", "sim": sim, "text": "；".join(bits)})
+    return hits
+
+
+def _webdetect(key, image, proxy, timeout):
+    """Blocking. Google Cloud Vision WEB_DETECTION: web pages / entities that
+    match the image (an official, Lens-like lookup). The key goes only into the
+    x-goog-api-key header of this request; redirects are not followed."""
+    if len(image) > VISION_MAX_BYTES:
+        raise ReverseError("Google Vision 跳过：图片超过 7MB")
+    body = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image).decode("ascii")},
+                "features": [{"type": "WEB_DETECTION", "maxResults": 10}],
+            }
+        ]
+    }
+    req = urllib.request.Request(
+        VISION_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+    )
+    data = _post(_opener(proxy), req, timeout, "Google Vision")
+    resp = (data.get("responses") or [{}])[0]
+    if not isinstance(resp, dict):
+        return []
+    if resp.get("error"):
+        raise ReverseError(f"Google Vision 返回错误 {_s((resp['error'] or {}).get('message'), 120)}")
+    wd = resp.get("webDetection") or {}
+    bits = []
+    labels = [x.get("label") for x in wd.get("bestGuessLabels") or [] if isinstance(x, dict) and x.get("label")]
+    if labels:
+        bits.append("最佳猜测：" + _s(labels[:2], 60))
+    ents = [x.get("description") for x in wd.get("webEntities") or [] if isinstance(x, dict) and x.get("description")]
+    if ents:
+        bits.append("网络实体：" + _s(ents[:6], 120))
+    full = wd.get("fullMatchingImages") or []
+    pages = [p for p in wd.get("pagesWithMatchingImages") or [] if isinstance(p, dict) and p.get("url")]
+    if full:
+        bits.append(f"找到 {len(full)} 张完全相同的图片")
+    for p in pages[:3]:
+        bits.append(f"网页：{_s(p.get('pageTitle'), 50)} {_s(p.get('url'), 120)}".strip())
+    if not bits:
+        return []
+    return [{"src": "Google 网页匹配", "sim": None, "text": "；".join(bits)}]
+
+
+def _tracemoe(image, proxy, timeout, min_sim):
+    """Blocking. Anime screenshot lookup on trace.moe (no key needed)."""
+    req = urllib.request.Request(
+        TRACEMOE_URL, data=image, method="POST", headers={"Content-Type": _sniff_mime(image)}
+    )
+    data = _post(_opener(proxy), req, timeout, "trace.moe")
+    if data.get("error"):
+        raise ReverseError(f"trace.moe 返回错误 {_s(data.get('error'), 80)}")
+    hits = []
+    for it in data.get("result") or []:
+        try:
+            sim = float(it.get("similarity") or 0) * 100
+        except (TypeError, ValueError):
+            continue
+        if sim < min_sim:
+            continue
+        t = ((it.get("anilist") or {}).get("title") or {}) if isinstance(it.get("anilist"), dict) else {}
+        title = t.get("native") or t.get("romaji") or t.get("english") or it.get("filename") or ""
+        bits = [f"动画《{_s(title)}》"] if _s(title) else []
+        if it.get("episode") not in (None, ""):
+            bits.append(f"第{_s(it.get('episode'), 10)}集")
+        if isinstance(it.get("from"), (int, float)):
+            bits.append(f"约{int(it['from'])}秒处")
+        if bits:
+            hits.append({"src": "trace.moe", "sim": sim, "text": "".join(bits)})
+    return hits
 
 
 def _clip(text, limit: int) -> str:
@@ -509,13 +673,15 @@ class VisionMemory(Star):
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
-    async def _caption_agent(self, event, pid, ts, user_text, prompt, url, timeout, steps, max_chars) -> str:
+    async def _caption_agent(self, event, pid, ts, user_text, prompt, url, timeout, steps, max_chars, hint="") -> str:
         """Let the vision model search (memory, then the web) before it
         describes the image. If it answered without calling any web-search tool,
         run it once more with an explicit demand to search. Returns text, or ''
         on any failure."""
         system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_SEARCH_PROMPT
         ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
+        if hint:
+            ask += f"\n\n以图搜图结果（相似度越高越可信，仍需结合图片核实）：\n{hint}"
         calls = []
         hooks = self._tool_hooks(calls)
         started = time.monotonic()
@@ -540,7 +706,62 @@ class VisionMemory(Star):
             text = text[:max_chars].rstrip() + "…（已截断）"
         return text
 
-    async def _caption_gemini(self, url, user_text, timeout, max_chars, max_mb) -> str:
+    async def _reverse_search(self, url, max_mb) -> list:
+        """Reverse image search (SauceNAO / trace.moe) on the actual image.
+        Returns hits above the similarity threshold, best first. Never raises."""
+        if not self._c("reverse_enable", False):
+            return []
+        key = (self._c("saucenao_api_key") or "").strip()
+        use_trace = bool(self._c("use_tracemoe", True))
+        gv_key = (self._c("gv_api_key") or "").strip()
+        if not key and not use_trace and not gv_key:
+            if not getattr(self, "_warned_reverse", False):
+                logger.warning("[vision_memory] 已开启以图搜图，但没有填任何 Key 且关闭了 trace.moe，不会搜索。")
+                self._warned_reverse = True
+            return []
+        min_sim = _as_int(self._c("reverse_min_similarity", 80), 80, 50, 99)
+        proxy = (self._c("reverse_proxy") or "").strip()
+        try:
+            image = await asyncio.wait_for(asyncio.to_thread(_read_image, url, max_mb * 1024 * 1024, 20), timeout=25)
+        except Exception as e:
+            logger.warning(f"[vision_memory] reverse search skipped, image unavailable: {type(e).__name__}")
+            return []
+        jobs = []
+        if key:
+            jobs.append(("SauceNAO", asyncio.to_thread(_saucenao, key, image, proxy, 25, min_sim)))
+        if gv_key:
+            jobs.append(("Google Vision", asyncio.to_thread(_webdetect, gv_key, image, proxy, 25)))
+        if use_trace:
+            jobs.append(("trace.moe", asyncio.to_thread(_tracemoe, image, proxy, 25, min_sim)))
+        results = await asyncio.gather(*[asyncio.wait_for(j, timeout=30) for _, j in jobs], return_exceptions=True)
+        hits = []
+        for (name, _), res in zip(jobs, results):
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            if isinstance(res, ReverseError):
+                logger.warning(f"[vision_memory] {res}")
+            elif isinstance(res, BaseException):
+                logger.warning(f"[vision_memory] {name} search failed: {type(res).__name__}")
+            else:
+                hits.extend(res)
+        hits.sort(key=lambda h: -(h["sim"] if h["sim"] is not None else -1))
+        self._dbg(
+            f"以图搜图: 阈值{min_sim}%；命中 "
+            f"{[(h['src'], None if h['sim'] is None else round(h['sim']), h['text'][:80]) for h in hits[:4]]}"
+        )
+        return hits[:4]
+
+    @staticmethod
+    def _format_reverse(hits) -> str:
+        if not hits:
+            return ""
+        lines = [
+            f"• {h['src']}：{h['text']}" if h["sim"] is None else f"• {h['src']} 相似度{h['sim']:.0f}%：{h['text']}"
+            for h in hits
+        ]
+        return _clip("\n".join(lines), 900)
+
+    async def _caption_gemini(self, url, user_text, timeout, max_chars, max_mb, hint="") -> str:
         """Identify the image through Gemini directly (own key, Google Search
         grounding). Does not use AstrBot's providers. Returns text or ''."""
         key = (self._c("gemini_api_key") or "").strip()
@@ -552,6 +773,8 @@ class VisionMemory(Star):
             return ""
         system = (self._c("caption_search_prompt") or "").strip() or DEFAULT_GEMINI_PROMPT
         ask = (f"用户消息：{_clip(user_text, 300)}\n\n" if (user_text or "").strip() else "") + "请按要求识别并描述这张图片。"
+        if hint:
+            ask += f"\n\n以图搜图结果（相似度越高越可信，仍需结合图片核实）：\n{hint}"
         try:
             image = await asyncio.wait_for(
                 asyncio.to_thread(_read_image, url, max_mb * 1024 * 1024, 20), timeout=25
@@ -660,23 +883,32 @@ class VisionMemory(Star):
                 continue
             t0 = time.monotonic()
             text = ""
+            rev_text = self._format_reverse(await self._reverse_search(url, max_mb))
             if direct:
-                text = await self._caption_gemini(url, user_text, search_timeout, max_chars, max_mb)
+                text = await self._caption_gemini(url, user_text, search_timeout, max_chars, max_mb, hint=rev_text)
                 if not text:
                     logger.warning("[vision_memory] Gemini direct caption empty, falling back to the AstrBot provider")
             elif search_ts is not None:
                 text = await self._caption_agent(
-                    event, pid, search_ts, user_text, prompt, url, search_timeout, search_steps, max_chars
+                    event, pid, search_ts, user_text, prompt, url, search_timeout, search_steps, max_chars,
+                    hint=rev_text,
                 )
                 if not text:
                     logger.warning("[vision_memory] search-assisted caption empty, falling back to plain caption")
             if not text and pid:
-                text = await self._caption_one(pid, prompt, url, timeout, max_chars)
+                text = await self._caption_one(
+                    pid,
+                    prompt + (f"\n\n以图搜图结果（仅供参考，需结合图片核实）：\n{rev_text}" if rev_text else ""),
+                    url, timeout, max_chars,
+                )
             self._dbg(
                 f"图片{i} [{_describe_image(url)}] 耗时 {time.monotonic() - t0:.1f}s，"
                 f"识图模型原样输出: {_clip(text, 2000) if text else '(空/失败)'}"
             )
-            parts.append(f"[图片{i}描述] {text or '(识别失败)'}")
+            line = f"[图片{i}描述] {text or '(识别失败)'}"
+            if rev_text:
+                line += f"\n[图片{i}以图搜图结果] {rev_text}"
+            parts.append(line)
 
         ok = sum(1 for p in parts if "描述]" in p and "(识别失败)" not in p)
         logger.info(f"[vision_memory] captioned {ok}/{len(urls)} image(s)")
