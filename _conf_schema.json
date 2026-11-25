@@ -166,8 +166,8 @@
       "ds_extra": {
         "description": "DeepSeek 额外请求参数（JSON）",
         "type": "text",
-        "default": "{\"thinking\": {\"type\": \"enabled\"}}",
-        "hint": "原样合并进请求体（不能覆盖 model、messages）。默认开启思考（推理）；若想让 DeepSeek 自己联网搜图可加上 \"tools\": [{\"type\": \"deepseek_web_search\"}]。思考模式下 temperature 等采样参数无效。"
+        "default": "{\"thinking\": {\"type\": \"disabled\"}}",
+        "hint": "原样合并进请求体（不能覆盖 model、messages）。默认关闭思考（速度快、不烧输出 token）；需要深度推理时改成 {\"thinking\": {\"type\": \"enabled\"}}；需要自带联网搜图可加上 \"tools\": [{\"type\": \"deepseek_web_search\"}]。"
       },
       "ds_max_tokens": {
         "description": "DeepSeek 最大输出 Token（含思考）",

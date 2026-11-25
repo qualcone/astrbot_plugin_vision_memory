@@ -51,9 +51,7 @@ PAGES_TEXT_CHARS = 3500
 # DeepSeek reader: a reasoning model reads far more text than the AstrBot-model reader, and
 # thinks for a long time, so the page excerpts are longer and the time limits are generous.
 DS_DEFAULT_BASE = "https://api.deepseek.com"
-# Thinking is explicit (the reasoning procedure is the point of this reader). max_tokens is left out on purpose:
-# thinking counts as output and the API's own default for thinking mode is 64K, a small value would cut the answer.
-DS_DEFAULT_EXTRA = '{"thinking": {"type": "enabled"}}'
+DS_DEFAULT_EXTRA = '{"thinking": {"type": "disabled"}}'
 DS_PAGE_BODY_CHARS = 1500
 DS_PAGES_TEXT_CHARS = 8000
 DS_TIMEOUT = 180
@@ -1174,7 +1172,8 @@ class VisionMemory(Star):
         )
 
         total = _as_int(self._c("total_timeout", TOTAL_TIMEOUT), TOTAL_TIMEOUT, TOTAL_TIMEOUT_MIN, 600)
-        if self._reader() == "deepseek":
+        ds_thinking = self._ds_extra().get("thinking")
+        if self._reader() == "deepseek" and isinstance(ds_thinking, dict) and ds_thinking.get("type") == "enabled":
             total = max(total, DS_MIN_TOTAL)  # a reasoning model cannot finish in the default 60s
         deadline = t_start + total
 
