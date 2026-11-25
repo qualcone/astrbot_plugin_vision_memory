@@ -993,16 +993,11 @@ class VisionMemory(Star):
     # searches with the identification text included.
     @filter.on_llm_request(priority=10)
     async def on_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        processed = False
         try:
             if req.image_urls:
-                processed = await self._identify(req, self._sticker_flags(event))
+                await self._identify(req, self._sticker_flags(event))
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] identify stage crashed: {type(e).__name__}: {e}")
-        try:
-            self._apply_guidance(req, processed)
-        except Exception as e:
-            logger.warning(f"[vision_memory] guidance failed: {type(e).__name__}: {e}")
 
     @filter.on_llm_request(priority=-100)
     async def on_req_debug(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1057,6 +1052,9 @@ class VisionMemory(Star):
         if not parts:
             return False
         block = _CAPTION_HEADER + "\n" + "\n".join(parts)
+        guidance = self._guidance_text()
+        if guidance:
+            block += "\n\n" + guidance
         base = (req.prompt or "").rstrip()
         part = _temp_part(block)
         if part is not None:
@@ -1570,24 +1568,15 @@ class VisionMemory(Star):
         return _field(text, "对象"), _field(text, "设定"), _field(text, "其他可能"), _field(text, "依据")
 
     # ---- guidance for the main model ----
-    def _recent_identified(self, req: ProviderRequest) -> bool:
-        for m in (getattr(req, "contexts", None) or [])[-CONTEXT_LOOKBACK:]:
-            if isinstance(m, dict):
-                t = _text_of(m.get("content"))
-                if _CAPTION_HEADER in t or TAG_PREFIX in t:
-                    return True
-        return False
-
-    def _apply_guidance(self, req: ProviderRequest, processed: bool) -> None:
+    # Attached to the temporary user-message block on the image turn instead of mutating
+    # req.system_prompt, so the main model's prompt prefix cache is never invalidated.
+    def _guidance_text(self) -> str:
         guidance = (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip()
         if not guidance:  # emptied in the settings = guidance off
-            return
+            return ""
         if guidance in OLD_GUIDANCE_DEFAULTS:  # unchanged copy of an older default
-            guidance = DEFAULT_GUIDANCE
-        if not (processed or self._recent_identified(req)):
-            return
-        if guidance not in (req.system_prompt or ""):
-            req.system_prompt = ((req.system_prompt or "") + "\n\n" + guidance).lstrip()
+            return DEFAULT_GUIDANCE
+        return guidance
 
     # ------------------------------------------------------------------
     # LivingMemory write path: LivingMemory's external HTTP API
