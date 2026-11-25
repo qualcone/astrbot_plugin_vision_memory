@@ -67,12 +67,13 @@ CACHE_DAYS = 7  # how long an identification is reused (setting; 0 = no cache)
 CACHE_MAX = 200
 CACHE_DIST = 4  # max differing bits (of 64) for two images to count as the same picture
 CACHE_KV_KEY = "id_cache_v1"
-# Stickers (表情包) are only identified when the user actually asks about them. A picture counts
-# as sticker-like when the platform flags it, or it is small (bytes / pixels); animated GIFs are
-# always skipped.
-STICKER_MODES = ("ask_only", "always")
-STICKER_MAX_BYTES = 60 * 1024
+# Stickers (表情包) are only identified when the user actually asks about them (or left
+# completely to the LLM via the `identify_image` tool in "tool_only" mode).
+STICKER_MODES = ("tool_only", "ask_only", "always")
+STICKER_TINY_BYTES = 25 * 1024
+STICKER_SMALL_SIDE = 400
 STICKER_MAX_SIDE = 512
+RECENT_IMAGES_MAX = 5
 DEFAULT_ASK_KEYWORDS = [
     "谁", "什么", "哪个", "哪部", "哪里", "哪儿", "叫啥", "出自", "认识", "认得", "角色", "识别", "是不是", "是哪",
     "是啥", "知道吗", "来源", "名字", "作品", "出处", "什么梗", "吗", "？", "?",
@@ -508,23 +509,48 @@ def _fetch_page(url: str, body_chars: int = PAGE_BODY_CHARS) -> dict:
     return {"title": _clip(p.title, 100), "desc": _clip(p.desc, 200), "body": _clip(p.body, body_chars)}
 
 
-def _image_side(image: bytes):
-    """Longest side in pixels, or None (no Pillow / not an image)."""
+def _image_meta(image: bytes):
+    """Return (width, height, is_animated, has_alpha) via Pillow, or None."""
     try:
         from PIL import Image
 
         with Image.open(io.BytesIO(image)) as im:
-            return max(im.size)
+            w, h = im.size
+            animated = bool(getattr(im, "is_animated", False)) or getattr(im, "n_frames", 1) > 1
+            alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+            return w, h, animated, alpha
     except Exception:
         return None
 
 
-def _sticker_like(image: bytes, flagged: bool) -> bool:
-    """A sticker per the platform flag, or a small picture (few bytes, few pixels)."""
-    if flagged or len(image) < STICKER_MAX_BYTES:
+def _is_animated(image: bytes) -> bool:
+    if _sniff_mime(image) == "image/gif":
         return True
-    side = _image_side(image)
-    return side is not None and side <= STICKER_MAX_SIDE
+    meta = _image_meta(image)
+    return bool(meta and meta[2])
+
+
+def _sticker_like(image: bytes, flagged: bool) -> bool:
+    """True when the platform flagged the image as a sticker, or its dimensions/alpha/ratio
+    strongly look like a sticker (avoiding misclassifying normal WebP/screenshots)."""
+    if flagged:
+        return True
+    meta = _image_meta(image)
+    if meta is None:
+        return len(image) < STICKER_TINY_BYTES
+    w, h, animated, alpha = meta
+    if animated:
+        return True
+    max_side = max(w, h)
+    ratio = (w / h) if h else 1.0
+    near_square = 0.72 <= ratio <= 1.38
+    if alpha and max_side <= STICKER_MAX_SIDE and near_square:
+        return True
+    if max_side <= STICKER_SMALL_SIDE and near_square:
+        return True
+    if len(image) < STICKER_TINY_BYTES and max_side <= STICKER_MAX_SIDE:
+        return True
+    return False
 
 
 def _dhash(image: bytes):
@@ -781,6 +807,7 @@ class VisionMemory(Star):
         self._cache = {}
         self._cache_loaded = False
         self._ds_no_image = False
+        self._recent_images = {}
         self._log_status()
 
     # ---- config / logging ----
@@ -910,7 +937,37 @@ class VisionMemory(Star):
     @staticmethod
     def _sticker_flags(event) -> list:
         """One bool per image of the message: did the platform mark it as a sticker?
-        (QQ sets subType 1 / a summary like [动画表情].)"""
+        Checks OneBot/aiocqhttp raw_message segments first (AstrBot's Comp.Image drops
+        subType/summary), then falls back to Comp.Image attributes."""
+        # 1. Inspect raw_message segments (OneBot v11 / NapCat / Lagrange / LLOneBot)
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            segs = raw.get("message") if isinstance(raw, dict) else getattr(raw, "message", None)
+            if isinstance(segs, list):
+                raw_flags = []
+                for seg in segs:
+                    if not isinstance(seg, dict):
+                        continue
+                    t = str(seg.get("type") or "").lower()
+                    data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                    if t == "mface":
+                        raw_flags.append(True)
+                    elif t == "image":
+                        st = data.get("subType")
+                        if st is None:
+                            st = data.get("sub_type")
+                        summary = str(data.get("summary") or "")
+                        is_st = (
+                            str(st) == "1"
+                            or "表情" in summary
+                            or bool(data.get("emoji_id") or data.get("emoji_package_id"))
+                        )
+                        raw_flags.append(is_st)
+                if raw_flags:
+                    return raw_flags
+        except Exception:
+            pass
+        # 2. Fallback to AstrBot message components
         try:
             import astrbot.api.message_components as Comp
 
@@ -920,7 +977,11 @@ class VisionMemory(Star):
                     st = getattr(comp, "subType", None)
                     if st is None:
                         st = getattr(comp, "sub_type", None)
-                    out.append(st == 1 or "表情" in str(getattr(comp, "summary", "") or ""))
+                    out.append(
+                        str(st) == "1"
+                        or str(getattr(comp, "_type", "") or "").lower() == "sticker"
+                        or "表情" in str(getattr(comp, "summary", "") or "")
+                    )
             return out
         except Exception:
             return []
@@ -995,7 +1056,11 @@ class VisionMemory(Star):
     async def on_req(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
             if req.image_urls:
-                await self._identify(req, self._sticker_flags(event))
+                umo = getattr(event, "unified_msg_origin", "") or ""
+                if umo:
+                    self._recent_images[umo] = list(req.image_urls)[:RECENT_IMAGES_MAX]
+                if self._sticker_mode() != "tool_only":
+                    await self._identify(req, self._sticker_flags(event))
         except Exception as e:  # last-resort guard: never break the chat
             logger.error(f"[vision_memory] identify stage crashed: {type(e).__name__}: {e}")
 
@@ -1072,7 +1137,7 @@ class VisionMemory(Star):
         logger.info(f"[vision_memory] identified {len(parts) - len(kept)}/{len(parts)} image(s); {len(kept)} kept for the main model")
         return True
 
-    async def _identify_one(self, url, user_text, vkey, gkey, flagged=False):
+    async def _identify_one(self, url, user_text, vkey, gkey, flagged=False, force=False):
         """Returns (text for the main model, identified?, short tag). Never raises."""
         t_start = time.monotonic()
         try:
@@ -1080,12 +1145,13 @@ class VisionMemory(Star):
         except Exception as e:
             logger.warning(f"[vision_memory] image could not be loaded: {type(e).__name__}: {e}")
             return "(图片无法读取，未识别)", False, ""
-        if _sniff_mime(image) == "image/gif":
-            self._dbg("GIF 动图（多半是表情包），跳过识别以节省调用")
-            return None, False, ""
-        if self._sticker_mode() == "ask_only" and not self._asked(user_text) and _sticker_like(image, flagged):
-            self._dbg("看起来是表情包，而且消息里没有提问，跳过识别（问了才识别；可在“速度、缓存与表情包”里改成总是识别）")
-            return None, False, ""
+        if not force:
+            if _is_animated(image):
+                self._dbg("动图（GIF / 动态 WebP，多半是表情包），跳过自动识别")
+                return None, False, ""
+            if self._sticker_mode() == "ask_only" and not self._asked(user_text) and _sticker_like(image, flagged):
+                self._dbg(f"看起来是表情包（flagged={flagged}），而且消息里没有提问，跳过自动识别")
+                return None, False, ""
 
         # cache: the same picture, or a re-compressed copy of it, is not identified twice
         await self._cache_load()
@@ -1848,6 +1914,36 @@ class VisionMemory(Star):
         if data.get("created", True) is False:
             return "该角色已在长期记忆中。"
         return "已写入长期记忆。" + (f"（注意：{note}，可能产生重复。）" if note else "")
+
+    @filter.llm_tool(name="identify_image")
+    async def identify_image(self, event: AstrMessageEvent, image_index: int = 1, question: str = ""):
+        """对当前消息、所回复消息或本会话最近收到的图片进行以图搜图与联网核实，识别其中的动漫/游戏角色、真人或表情包及其出处和外貌设定。当你不确定图中角色是谁或用户询问图片来源/角色名时主动调用；普通闲聊表情包无需调用。
+
+        Args:
+            image_index(integer): 要识别第几张图片（从 1 开始，默认 1）
+            question(string): 可选，用户的提问或需要重点核实的问题，可为空
+        """
+        if not (self._gv_usable() or self._verify_on()):
+            return "识图插件尚未配置可用的识别来源（Google 以图搜图或联网大模型），无法执行识别。"
+        urls = await self._images_of(event)
+        if not urls:
+            umo = getattr(event, "unified_msg_origin", "") or ""
+            urls = list(self._recent_images.get(umo) or [])
+        if not urls:
+            return "当前消息、所回复消息及最近记录里都没有找到可识别的图片。"
+        idx = _as_int(image_index, 1, 1, len(urls)) - 1
+        vkey = (self._c("gv_api_key") or "").strip()
+        gkey = (self._c("gemini_api_key") or "").strip()
+        q = (question or "").strip() or (getattr(event, "message_str", "") or "").strip()
+        logger.info(f"[vision_memory] identify_image called by model: index={idx + 1}/{len(urls)}")
+        text, identified, _ = await self._identify_one(urls[idx], q, vkey, gkey, flagged=False, force=True)
+        if not text:
+            return "未能识别该图片。"
+        guidance = self._guidance_text()
+        out = f"{_CAPTION_HEADER}\n[图片{idx + 1}] {text}"
+        if guidance:
+            out += "\n\n" + guidance
+        return out
 
     @filter.llm_tool(name="save_character_memory")
     async def save_character_memory(
