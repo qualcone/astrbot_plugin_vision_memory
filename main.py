@@ -1027,16 +1027,20 @@ class VisionMemory(Star):
                     "开" if (self._c("guidance_text", DEFAULT_GUIDANCE) or "").strip() else "关（内容为空）",
                 )
             )
-            if not (self._gv_usable() or self._verify_on()):
+            if not self._any_ready():
                 logger.warning(self._missing_msg())
         except Exception as e:
             logger.warning(f"[vision_memory] status log failed: {type(e).__name__}")
 
+    def _any_ready(self) -> bool:
+        """Ready if any of Step 1 A (Google+reader), Step 1 B (verify), or Step 2 (reader alone) is configured."""
+        return self._gv_usable() or self._verify_on() or self._reader_ready()
+
     def _missing_msg(self) -> str:
         second = {"astrbot": "第二步选择的 AstrBot 提供商", "deepseek": "第二步的 DeepSeek 密钥和模型"}.get(self._reader(), "第二步的 Gemini 密钥")
         return (
-            "[vision_memory] 图片识别需要至少启用并配好一个第一步来源：A. Google 以图搜图（填 Google Vision 密钥，"
-            f"并配好{second}来读取网页），或 B. 联网大模型（填接口地址、Key、模型）。否则图片会原样传给主模型。"
+            "[vision_memory] 图片识别需要至少配置以下之一：第一步 B（联网大模型），或第二步的模型"
+            f"（{second}，可单独使用也可配合第一步 A 的 Google 以图搜图）。否则图片会原样传给主模型。"
         )
 
     @staticmethod
@@ -1091,7 +1095,7 @@ class VisionMemory(Star):
         the main model can still look at them. Returns True if anything was added."""
         vkey = (self._c("gv_api_key") or "").strip()
         gkey = (self._c("gemini_api_key") or "").strip()
-        if not (self._gv_usable() or self._verify_on()):
+        if not self._any_ready():
             self._warn_once("nokeys", self._missing_msg())
             return False
         user_text = req.prompt or ""
@@ -1199,13 +1203,13 @@ class VisionMemory(Star):
                     fail = "以图搜图失败，无法确认。"
             timing["Google"] = time.monotonic() - t0
             conclusion = ""
-            if found and reader_ok:
+            if reader_ok and (found or not gv_on):
                 t1 = time.monotonic()
                 try:
-                    conclusion = await self._read(image, user_text, found, _format_found(found), gkey)
+                    conclusion = await self._read(image, user_text, found, _format_found(found) if found else "", gkey)
                 except Exception as e:
-                    logger.warning(f"[vision_memory] Gemini step failed: {type(e).__name__}: {e}")
-                timing["读网页"] = time.monotonic() - t1
+                    logger.warning(f"[vision_memory] step-2 reader failed: {type(e).__name__}: {e}")
+                timing["读网页" if found else "第二步直接识图"] = time.monotonic() - t1
             return found, fail, conclusion
 
         async def source_b():
@@ -1244,18 +1248,18 @@ class VisionMemory(Star):
             "耗时：" + "，".join(f"{k} {x:.1f}s" for k, x in timing.items())
             + f"；已用 {time.monotonic() - t_start:.1f}s / 总时限 {total}s"
         )
-        if not found and not v:
-            self._dbg("两个来源都没有结果")
+        if not found and not conclusion and not v:
+            self._dbg("所有已启用的识别来源都没有结果")
             if dropped:
                 return "识别超时（超过总时限），无法确认。", False, ""
-            return (google_fail or ("以图搜图没有找到相关网页，无法确认。" if gv_on else "联网大模型没有给出可用的结果，无法确认。")), False, ""
+            return (google_fail or ("以图搜图没有找到相关网页，无法确认。" if gv_on else "识图模型没有给出可用的结果，无法确认。")), False, ""
         summary = _format_found(found) if found else ""
-        self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果（或未启用），只用联网大模型的结果")
+        self._dbg(f"Google Vision 结果:\n{summary}" if found else "Google Vision 没有结果（或未启用），直接使用后续模型结果")
 
         raw = ""  # the model's own text, passed through when it ignores the answer format
         obj = src = setting = evidence = candidates = ""
         structured = False
-        if found and reader_ok:
+        if reader_ok and (found or conclusion):
             if not conclusion and not v:
                 return f"以图搜图找到的信息（识图模型未能给出结论，请自行判断）：\n{summary}", False, ""
             if conclusion:
@@ -1509,7 +1513,9 @@ class VisionMemory(Star):
 
     async def _pages_text(self, found, body_chars: int = PAGE_BODY_CHARS, total: int = PAGES_TEXT_CHARS) -> str:
         """Fetch the top pages ourselves (the AstrBot model cannot open links)."""
-        pages = found["pages"][:4]
+        if not found:
+            return ""
+        pages = (found.get("pages") or [])[:4]
         if not pages:
             return ""
         results = await asyncio.gather(
@@ -1557,9 +1563,9 @@ class VisionMemory(Star):
         pages = await self._pages_text(found, DS_PAGE_BODY_CHARS, DS_PAGES_TEXT_CHARS)
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
-            + "以图搜图找到的信息：\n" + summary
-            + (f"\n\n网页内容（由插件抓取）：\n{pages}" if pages else "")
-            + "\n\n请判断图中是哪部作品的哪个角色。"
+            + (f"以图搜图找到的信息：\n{summary}\n\n" if summary else "未启用以图搜图，请直接根据图片识别。\n\n")
+            + (f"网页内容（由插件抓取）：\n{pages}\n\n" if pages else "")
+            + "请判断图中是哪部作品的哪个角色。"
         )
         extra = self._ds_extra()
 
@@ -1586,9 +1592,9 @@ class VisionMemory(Star):
         pages = await self._pages_text(found)
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
-            + "以图搜图找到的信息：\n" + summary
-            + (f"\n\n网页内容（由插件抓取）：\n{pages}" if pages else "")
-            + "\n\n请判断图中是哪部作品的哪个角色。"
+            + (f"以图搜图找到的信息：\n{summary}\n\n" if summary else "未启用以图搜图，请直接根据图片识别。\n\n")
+            + (f"网页内容（由插件抓取）：\n{pages}\n\n" if pages else "")
+            + "请判断图中是哪部作品的哪个角色。"
         )
         img = "base64://" + base64.b64encode(image).decode("ascii")
         try:
@@ -1611,10 +1617,13 @@ class VisionMemory(Star):
     async def _gemini_read(self, image, user_text, found, summary, key) -> str:
         ask = (
             (f"用户消息：{_clip(user_text, 300)}\n\n" if user_text.strip() else "")
-            + "以图搜图找到的信息：\n" + summary
-            + "\n\n请阅读上面的网页，判断图中是哪部作品的哪个角色。"
+            + (
+                "以图搜图找到的信息：\n" + summary + "\n\n请阅读上面的网页，判断图中是哪部作品的哪个角色。"
+                if summary
+                else "未启用以图搜图，请直接根据图片判断图中是哪部作品的哪个角色。"
+            )
         )
-        chains = [("url_context",), ()] if found["pages"] else [()]
+        chains = [("url_context",), ()] if (found and found.get("pages")) else [("google_search",), ()]
         return await self._gemini_ask(key, image, ask, DEFAULT_GEMINI_PROMPT, chains)
 
     async def _gemini_profile(self, image, user_text, obj, src, summary, key):
@@ -1923,8 +1932,8 @@ class VisionMemory(Star):
             image_index(integer): 要识别第几张图片（从 1 开始，默认 1）
             question(string): 可选，用户的提问或需要重点核实的问题，可为空
         """
-        if not (self._gv_usable() or self._verify_on()):
-            return "识图插件尚未配置可用的识别来源（Google 以图搜图或联网大模型），无法执行识别。"
+        if not self._any_ready():
+            return "识图插件尚未配置可用的识别来源（联网大模型或第二步识图模型），无法执行识别。"
         urls = await self._images_of(event)
         if not urls:
             umo = getattr(event, "unified_msg_origin", "") or ""
