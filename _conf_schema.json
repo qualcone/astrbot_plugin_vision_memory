@@ -167,7 +167,13 @@
         "description": "DeepSeek 额外请求参数（JSON）",
         "type": "text",
         "default": "{\"thinking\": {\"type\": \"enabled\"}}",
-        "hint": "原样合并进请求体（不能覆盖 model、messages）。默认明确开启思考（推理）。注意：思考也算在输出里，官方思考模式默认输出上限是 64K，所以默认不设 max_tokens，设小了会把答案截断。思考模式下 temperature 等采样参数无效。"
+        "hint": "原样合并进请求体（不能覆盖 model、messages）。默认开启思考（推理）；若想让 DeepSeek 自己联网搜图可加上 \"tools\": [{\"type\": \"deepseek_web_search\"}]。思考模式下 temperature 等采样参数无效。"
+      },
+      "ds_max_tokens": {
+        "description": "DeepSeek 最大输出 Token（含思考）",
+        "type": "int",
+        "default": 8192,
+        "hint": "防止认不出图时思考死循环把 64K 额度跑满。默认 8192（思考 + 最终四行回答一般足够）；填 0 表示不限制（使用官方默认 64K）。"
       },
       "ds_timeout": {
         "description": "DeepSeek 超时（秒）",

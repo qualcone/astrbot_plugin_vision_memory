@@ -57,6 +57,7 @@ DS_DEFAULT_EXTRA = '{"thinking": {"type": "enabled"}}'
 DS_PAGE_BODY_CHARS = 1500
 DS_PAGES_TEXT_CHARS = 8000
 DS_TIMEOUT = 180
+DS_DEFAULT_MAX_TOKENS = 8192  # cap runaway thinking loops (API default is 64K)
 DS_MIN_TOTAL = 150  # the whole-identification limit is never lower than this with this reader
 VERIFY_TIMEOUT = 180  # default total seconds for the vendor model (settable)
 VERIFY_TIMEOUT_MIN = 30
@@ -96,6 +97,7 @@ GROUP_OF = {
     "ds_model": "gemini",
     "ds_base_url": "gemini",
     "ds_extra": "gemini",
+    "ds_max_tokens": "gemini",
     "ds_timeout": "gemini",
     "ds_send_image": "gemini",
     "ds_prompt": "gemini",
@@ -1568,6 +1570,9 @@ class VisionMemory(Star):
             + "请判断图中是哪部作品的哪个角色。"
         )
         extra = self._ds_extra()
+        max_toks = _as_int(self._c("ds_max_tokens", DS_DEFAULT_MAX_TOKENS), DS_DEFAULT_MAX_TOKENS, 0, 65536)
+        if max_toks > 0 and "max_tokens" not in extra:
+            extra = {**extra, "max_tokens": max_toks}
 
         async def call(img):
             return await asyncio.wait_for(
